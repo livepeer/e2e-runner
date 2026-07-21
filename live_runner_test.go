@@ -28,6 +28,8 @@ import (
 const (
 	liveRunnerSecret = "live-runner-secret"
 	liveRunnerApp    = "livepeer-sample/echo"
+
+	domainProxyURLTemplate = "http://{proxy}.localhost:{http_port}"
 )
 
 const (
@@ -52,10 +54,16 @@ var pythonRunnerSessionControlsScript string
 var pythonRunnerMissingPriceScript string
 
 type testOrchestrator struct {
-	httpBase string
-	cliBase  string
-	cancel   context.CancelFunc
-	logPath  string
+	httpBase         string
+	cliBase          string
+	proxyURLTemplate string
+	cancel           context.CancelFunc
+	logPath          string
+}
+
+type orchestratorOptions struct {
+	proxyURLTemplate string
+	staticConfigPath string
 }
 
 type heartbeatPayload struct {
@@ -145,6 +153,38 @@ type runnerConfig struct {
 	label     string
 	metadata  string
 	capacity  int
+	proxy     bool
+}
+
+type staticRunnerConfig struct {
+	Runners []staticRunnerConfigEntry `json:"runners"`
+}
+
+type staticRunnerConfigEntry struct {
+	Label     string    `json:"label"`
+	Routing   string    `json:"routing"`
+	Proxy     bool      `json:"proxy,omitempty"`
+	RunnerURL string    `json:"runner_url"`
+	App       string    `json:"app"`
+	Metadata  string    `json:"metadata,omitempty"`
+	Mode      string    `json:"mode"`
+	Capacity  int       `json:"capacity"`
+	PriceInfo priceInfo `json:"price_info"`
+	HealthURL string    `json:"health_url"`
+}
+
+type runnerUpstream struct {
+	server      *httptest.Server
+	entered     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+type staticRunnerScenario struct {
+	name     string
+	route    string
+	cfg      runnerConfig
+	upstream *runnerUpstream
 }
 
 type runnerRegistration interface {
@@ -245,6 +285,16 @@ func (goRunnerImplementation) StartSessionControlRunner(t *testing.T, ctx contex
 				ProxyID:  proxy.ProxyID,
 				ProxyURL: proxy.URL,
 			})
+		case "/proxy-default":
+			proxy, err := reg.CreateProxy(ctx, r, "")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			respondJSON(t, w, proxyCreateResponse{
+				ProxyID:  proxy.ProxyID,
+				ProxyURL: proxy.URL,
+			})
 		case "/stop":
 			if err := liverunner.StopSession(ctx, nil, r, time.Second); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -252,7 +302,7 @@ func (goRunnerImplementation) StartSessionControlRunner(t *testing.T, ctx contex
 			}
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			if strings.HasPrefix(r.URL.Path, "/proxy-target") {
+			if strings.HasPrefix(r.URL.Path, "/proxy-target") || strings.HasPrefix(r.URL.Path, "/app-proxy") {
 				body, err := io.ReadAll(r.Body)
 				if err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -280,61 +330,110 @@ func (goRunnerImplementation) StartSessionControlRunner(t *testing.T, ctx contex
 	return registered
 }
 
-func runPersistentRunnerScenario(t *testing.T, ctx context.Context, orch *testOrchestrator, impl runnerImplementation, cfg runnerConfig) {
+func newRunnerUpstream(t *testing.T, capacity int) *runnerUpstream {
 	t.Helper()
-	cfg.runnerURL = "http://runner.invalid"
-	reg := impl.Start(t, ctx, orch, cfg)
-	runnerID := reg.RunnerID()
-	require.Equal(t, orch.httpBase, reg.OrchestratorURL())
-
-	runner := requireDiscoveredRunner(t, orch, runnerID)
-	require.Equal(t, liveRunnerApp, runner.App)
-	require.Equal(t, cfg.metadata, runner.Metadata)
-	require.Equal(t, liverunner.ModePersistent, runner.Mode)
-	require.Contains(t, runner.URL, "/apps/"+runnerID+"/session")
-	requireRunnerCapacity(t, runner, cfg.capacity, 0, cfg.capacity)
-
-	s1 := reserveSession(t, orch, runnerID)
-	requireRunnerCapacity(t, requireDiscoveredRunner(t, orch, runnerID), cfg.capacity, 1, cfg.capacity-1)
-	s2 := reserveSession(t, orch, runnerID)
-	require.NotEqual(t, s1.SessionID, s2.SessionID)
-	requireRunnerCapacity(t, requireDiscoveredRunner(t, orch, runnerID), cfg.capacity, cfg.capacity, 0)
-	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/session", nil, http.StatusServiceUnavailable)
-
-	stopSession(t, orch, runnerID, s1.SessionID)
-	requireRunnerCapacity(t, requireDiscoveredRunner(t, orch, runnerID), cfg.capacity, cfg.capacity-1, 1)
-	s3 := reserveSession(t, orch, runnerID)
-	require.NotEmpty(t, s3.SessionID)
-
-	reg.Close(t)
-	requireRunnerAbsent(t, orch, runnerID)
-	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/session", nil, http.StatusNotFound)
-}
-
-func runSingleShotRunnerScenario(t *testing.T, ctx context.Context, orch *testOrchestrator, impl runnerImplementation, cfg runnerConfig) {
-	t.Helper()
-	release := make(chan struct{})
-	entered := make(chan struct{}, cfg.capacity)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := &runnerUpstream{
+		entered: make(chan struct{}, capacity+1),
+		release: make(chan struct{}),
+	}
+	upstream.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.URL.Path == "/hold" {
-			entered <- struct{}{}
-			<-release
+			upstream.entered <- struct{}{}
+			<-upstream.release
 		}
 		_, _ = w.Write([]byte("ok"))
 	}))
-	defer upstream.Close()
+	t.Cleanup(func() {
+		upstream.releaseRequests()
+		upstream.server.Close()
+	})
+	return upstream
+}
 
-	cfg.runnerURL = upstream.URL
+func (u *runnerUpstream) releaseRequests() {
+	u.releaseOnce.Do(func() {
+		close(u.release)
+	})
+}
+
+func runDynamicRunnerScenario(t *testing.T, ctx context.Context, orch *testOrchestrator, impl runnerImplementation, cfg runnerConfig) {
+	t.Helper()
+	upstream := newRunnerUpstream(t, cfg.capacity)
+	cfg.runnerURL = upstream.server.URL
 	reg := impl.Start(t, ctx, orch, cfg)
 	runnerID := reg.RunnerID()
 	require.Equal(t, orch.httpBase, reg.OrchestratorURL())
 
-	runner := requireDiscoveredRunner(t, orch, runnerID)
+	runRegisteredRunnerScenario(t, orch, runnerID, cfg, upstream)
+
+	reg.Close(t)
+	requireRunnerMetadataAbsent(t, orch, cfg.metadata)
+	if cfg.mode == liverunner.ModePersistent {
+		requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/session", nil, http.StatusNotFound)
+		return
+	}
+	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/app/after-close", strings.NewReader("x"), http.StatusNotFound)
+}
+
+func runRegisteredRunnerScenario(t *testing.T, orch *testOrchestrator, route string, cfg runnerConfig, upstream *runnerUpstream) {
+	t.Helper()
+	runner := requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata)
 	require.Equal(t, liveRunnerApp, runner.App)
 	require.Equal(t, cfg.metadata, runner.Metadata)
-	require.Equal(t, liverunner.ModeSingleShot, runner.Mode)
-	require.Contains(t, runner.URL, "/apps/"+runnerID+"/app")
+	require.Equal(t, cfg.mode, runner.Mode)
 	requireRunnerCapacity(t, runner, cfg.capacity, 0, cfg.capacity)
+
+	if cfg.mode == liverunner.ModePersistent {
+		runPersistentRunnerLifecycle(t, orch, route, cfg)
+		return
+	}
+	runSingleShotRunnerLifecycle(t, orch, route, cfg, upstream)
+}
+
+func runPersistentRunnerLifecycle(t *testing.T, orch *testOrchestrator, route string, cfg runnerConfig) {
+	t.Helper()
+	runner := requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata)
+	require.Equal(t, orch.httpBase+"/apps/"+url.PathEscape(route)+"/session", runner.URL)
+
+	s1 := reserveSession(t, orch, route)
+	requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, 1, cfg.capacity-1)
+	s2 := reserveSession(t, orch, route)
+	require.NotEqual(t, s1.SessionID, s2.SessionID)
+	requirePersistentAppURL(t, orch, route, s1, cfg.proxy)
+	requirePersistentAppURL(t, orch, route, s2, cfg.proxy)
+	requireStatus(t, http.MethodPost, s1.AppURL+"/check", strings.NewReader("x"), http.StatusOK)
+
+	requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, cfg.capacity, 0)
+	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(route)+"/session", nil, http.StatusServiceUnavailable)
+
+	stopSession(t, orch, route, s1.SessionID)
+	requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, cfg.capacity-1, 1)
+	s3 := reserveSession(t, orch, route)
+	require.NotEmpty(t, s3.SessionID)
+	requirePersistentAppURL(t, orch, route, s3, cfg.proxy)
+}
+
+func requirePersistentAppURL(t *testing.T, orch *testOrchestrator, route string, session sessionResponse, proxy bool) {
+	t.Helper()
+	if proxy {
+		requireDomainProxyURL(t, orch, session.AppURL, "")
+		return
+	}
+	require.Equal(t, orch.httpBase+"/apps/"+url.PathEscape(route)+"/session/"+url.PathEscape(session.SessionID)+"/app", session.AppURL)
+}
+
+func runSingleShotRunnerLifecycle(t *testing.T, orch *testOrchestrator, route string, cfg runnerConfig, upstream *runnerUpstream) {
+	t.Helper()
+	runner := requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata)
+	if cfg.proxy {
+		requireDomainProxyURL(t, orch, runner.URL, route)
+	} else {
+		require.Equal(t, orch.httpBase+"/apps/"+url.PathEscape(route)+"/app", runner.URL)
+	}
 
 	var wg sync.WaitGroup
 	errs := make(chan error, cfg.capacity)
@@ -342,56 +441,143 @@ func runSingleShotRunnerScenario(t *testing.T, ctx context.Context, orch *testOr
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := checkStatus(http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/app/hold", strings.NewReader("x"), http.StatusOK)
+			_, err := checkStatus(http.MethodPost, runner.URL+"/hold", strings.NewReader("x"), http.StatusOK)
 			errs <- err
 		}()
 	}
-	requireReceiveN(t, entered, cfg.capacity)
-	requireRunnerCapacity(t, requireDiscoveredRunner(t, orch, runnerID), cfg.capacity, cfg.capacity, 0)
-	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/app/blocked", strings.NewReader("x"), http.StatusServiceUnavailable)
-	close(release)
+	requireReceiveN(t, upstream.entered, cfg.capacity)
+	requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, cfg.capacity, 0)
+	requireStatus(t, http.MethodPost, runner.URL+"/blocked", strings.NewReader("x"), http.StatusServiceUnavailable)
+	upstream.releaseRequests()
 	wg.Wait()
 	close(errs)
 	for err := range errs {
 		require.NoError(t, err)
 	}
-	requireRunnerCapacity(t, requireDiscoveredRunner(t, orch, runnerID), cfg.capacity, 0, cfg.capacity)
-
-	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/app/after-release", strings.NewReader("x"), http.StatusOK)
-	reg.Close(t)
-	requireRunnerAbsent(t, orch, runnerID)
-	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/app/after-close", strings.NewReader("x"), http.StatusNotFound)
+	requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, 0, cfg.capacity)
+	requireStatus(t, http.MethodPost, runner.URL+"/after-release", strings.NewReader("x"), http.StatusOK)
 }
 
-func TestRunnerImplementations(t *testing.T) {
-	orch := startOffchainOrchestrator(t)
+func requireDomainProxyURL(t *testing.T, orch *testOrchestrator, rawURL, route string) {
+	t.Helper()
+	require.NotEmpty(t, orch.proxyURLTemplate)
+	if route != "" {
+		require.Equal(t, strings.Replace(orch.proxyURLTemplate, "{proxy}", route, 1), rawURL)
+		return
+	}
+	u, err := url.Parse(rawURL)
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(orch.httpBase)
+	require.NoError(t, err)
+	require.Equal(t, "http", u.Scheme)
+	require.Equal(t, serviceURL.Port(), u.Port())
+	require.True(t, strings.HasSuffix(u.Hostname(), ".localhost"), rawURL)
+	require.NotEqual(t, ".localhost", u.Hostname())
+	require.Empty(t, u.EscapedPath())
+}
+
+func TestDynamicRunnerProxyRegistration(t *testing.T) {
+	orch := startOffchainOrchestrator(t, orchestratorOptions{proxyURLTemplate: domainProxyURLTemplate})
 	ctx := context.Background()
 
 	for _, impl := range runnerImplementations() {
 		impl := impl
 		t.Run(impl.Name(), func(t *testing.T) {
-			for _, tc := range []struct {
-				name string
-				mode string
-			}{
-				{name: "persistent", mode: liverunner.ModePersistent},
-				{name: "single-shot", mode: liverunner.ModeSingleShot},
-			} {
-				tc := tc
-				t.Run(tc.name, func(t *testing.T) {
-					cfg := runnerConfig{
-						mode:     tc.mode,
-						label:    impl.Name() + "-" + tc.name,
-						metadata: fmt.Sprintf(`{"implementation":%q,"mode":%q}`, impl.Name(), tc.mode),
-						capacity: 2,
+			for _, mode := range []string{liverunner.ModePersistent, liverunner.ModeSingleShot} {
+				for _, proxy := range []bool{false, true} {
+					state := "proxy-unset"
+					if proxy {
+						state = "proxy-set"
 					}
-					if tc.mode == liverunner.ModePersistent {
-						runPersistentRunnerScenario(t, ctx, orch, impl, cfg)
-						return
-					}
-					runSingleShotRunnerScenario(t, ctx, orch, impl, cfg)
-				})
+					t.Run(mode+"/"+state, func(t *testing.T) {
+						cfg := runnerConfig{
+							mode:     mode,
+							label:    impl.Name() + "-" + mode + "-" + state,
+							metadata: fmt.Sprintf(`{"registration":"dynamic","implementation":%q,"mode":%q,"proxy":%t}`, impl.Name(), mode, proxy),
+							capacity: 2,
+							proxy:    proxy,
+						}
+						runDynamicRunnerScenario(t, ctx, orch, impl, cfg)
+					})
+				}
 			}
+		})
+	}
+}
+
+func TestStaticRunnerProxyConfiguration(t *testing.T) {
+	t.Run("startup config", func(t *testing.T) {
+		cfg, scenarios := newStaticRunnerMatrix(t, "startup-static")
+		data, err := json.Marshal(cfg)
+		require.NoError(t, err)
+		configPath := filepath.Join(t.TempDir(), "live-runners.json")
+		require.NoError(t, os.WriteFile(configPath, data, 0o600))
+		orch := startOffchainOrchestrator(t, orchestratorOptions{
+			proxyURLTemplate: domainProxyURLTemplate,
+			staticConfigPath: configPath,
+		})
+		runStaticRunnerMatrix(t, orch, scenarios)
+	})
+
+	t.Run("CLI registration", func(t *testing.T) {
+		orch := startOffchainOrchestrator(t, orchestratorOptions{proxyURLTemplate: domainProxyURLTemplate})
+		cfg, scenarios := newStaticRunnerMatrix(t, "cli-static")
+		registerStaticRunnerConfig(t, orch, cfg, http.StatusOK)
+		runStaticRunnerMatrix(t, orch, scenarios)
+	})
+}
+
+func newStaticRunnerMatrix(t *testing.T, prefix string) (staticRunnerConfig, []staticRunnerScenario) {
+	t.Helper()
+	var cfg staticRunnerConfig
+	var scenarios []staticRunnerScenario
+	for _, mode := range []string{liverunner.ModePersistent, liverunner.ModeSingleShot} {
+		for _, proxy := range []bool{false, true} {
+			state := "proxy-unset"
+			if proxy {
+				state = "proxy-set"
+			}
+			name := mode + "/" + state
+			route := prefix + "-" + mode + "-" + state
+			metadata := fmt.Sprintf(`{"registration":%q,"mode":%q,"proxy":%t}`, prefix, mode, proxy)
+			upstream := newRunnerUpstream(t, 2)
+			runnerCfg := runnerConfig{
+				runnerURL: upstream.server.URL,
+				mode:      mode,
+				label:     route,
+				metadata:  metadata,
+				capacity:  2,
+				proxy:     proxy,
+			}
+			cfg.Runners = append(cfg.Runners, staticRunnerConfigEntry{
+				Label:     route,
+				Routing:   "label",
+				Proxy:     proxy,
+				RunnerURL: upstream.server.URL,
+				App:       liveRunnerApp,
+				Metadata:  metadata,
+				Mode:      mode,
+				Capacity:  2,
+				PriceInfo: priceInfo{PricePerUnit: 10, PixelsPerUnit: 1, Unit: "WEI"},
+				HealthURL: upstream.server.URL + "/health",
+			})
+			scenarios = append(scenarios, staticRunnerScenario{
+				name:     name,
+				route:    route,
+				cfg:      runnerCfg,
+				upstream: upstream,
+			})
+		}
+	}
+	return cfg, scenarios
+}
+
+func runStaticRunnerMatrix(t *testing.T, orch *testOrchestrator, scenarios []staticRunnerScenario) {
+	t.Helper()
+	for _, scenario := range scenarios {
+		scenario := scenario
+		t.Run(scenario.name, func(t *testing.T) {
+			runRegisteredRunnerScenario(t, orch, scenario.route, scenario.cfg, scenario.upstream)
 		})
 	}
 }
@@ -533,9 +719,28 @@ func TestRunnerSessionControlAPIs(t *testing.T) {
 			require.Equal(t, session.SessionID, proxied.SessionID)
 			require.Contains(t, proxied.ControlURL, "/runner/"+runnerID+"/session/"+session.SessionID)
 
+			var createdDefaultProxy proxyCreateResponse
+			requireJSONStatus(t, http.MethodPost, session.AppURL+"/proxy-default", nil, nil, http.StatusOK, &createdDefaultProxy)
+			require.NotEmpty(t, createdDefaultProxy.ProxyID)
+			require.NotEmpty(t, createdDefaultProxy.ProxyURL)
+			require.Contains(t, createdDefaultProxy.ProxyURL, orch.httpBase+"/run/")
+
+			defaultProxiedBody, err := checkStatus(http.MethodPost, createdDefaultProxy.ProxyURL+"/app-proxy/foo?y=2", strings.NewReader("default-body"), http.StatusOK)
+			require.NoError(t, err)
+			var defaultProxied proxiedTargetResponse
+			require.NoError(t, json.Unmarshal([]byte(defaultProxiedBody), &defaultProxied), defaultProxiedBody)
+			require.Equal(t, http.MethodPost, defaultProxied.Method)
+			require.Equal(t, "/app-proxy/foo", defaultProxied.Path)
+			require.Equal(t, "y=2", defaultProxied.Query)
+			require.Equal(t, "default-body", defaultProxied.Body)
+			require.Equal(t, runnerID, defaultProxied.RunnerRoute)
+			require.Equal(t, session.SessionID, defaultProxied.SessionID)
+			require.Contains(t, defaultProxied.ControlURL, "/runner/"+runnerID+"/session/"+session.SessionID)
+
 			requireStatus(t, http.MethodPost, session.AppURL+"/stop", nil, http.StatusNoContent)
 			requireRunnerCapacity(t, requireDiscoveredRunner(t, orch, runnerID), 1, 0, 1)
 			requireStatus(t, http.MethodPost, createdProxy.ProxyURL+"/after-stop", strings.NewReader("x"), http.StatusNotFound)
+			requireStatus(t, http.MethodPost, createdDefaultProxy.ProxyURL+"/after-stop", strings.NewReader("x"), http.StatusNotFound)
 			_ = reserveSession(t, orch, runnerID)
 
 			reg.Close(t)
@@ -587,8 +792,13 @@ func TestOnchainPriceInfoRequired(t *testing.T) {
 	})
 }
 
-func startOffchainOrchestrator(t *testing.T) *testOrchestrator {
+func startOffchainOrchestrator(t *testing.T, optionList ...orchestratorOptions) *testOrchestrator {
 	t.Helper()
+	require.LessOrEqual(t, len(optionList), 1)
+	var options orchestratorOptions
+	if len(optionList) == 1 {
+		options = optionList[0]
+	}
 	goLivepeerDir := repoDir(t, envGoLivepeerDir, "go-livepeer")
 	livepeerBin := os.Getenv(envLivepeerBin)
 	if livepeerBin == "" {
@@ -599,21 +809,34 @@ func startOffchainOrchestrator(t *testing.T) *testOrchestrator {
 	rtmpAddr := freeAddr(t)
 	serviceAddr := "http://" + httpAddr
 	ctx, cancel := context.WithCancel(context.Background())
+	proxyURLTemplate := ""
+	if options.proxyURLTemplate != "" {
+		_, httpPort, err := net.SplitHostPort(httpAddr)
+		require.NoError(t, err)
+		proxyURLTemplate = strings.ReplaceAll(options.proxyURLTemplate, "{http_port}", httpPort)
+	}
 
 	logFile, err := os.Create(filepath.Join(t.TempDir(), "livepeer.log"))
 	require.NoError(t, err)
-	cmd := exec.CommandContext(ctx, livepeerBin,
+	args := []string{
 		"-network", "offchain",
 		"-orchestrator",
 		"-orchSecret", liveRunnerSecret,
 		"-useLiveRunners",
 		"-serviceAddr", serviceAddr,
-		"-httpAddr", "http://"+httpAddr,
+		"-httpAddr", "http://" + httpAddr,
 		"-cliAddr", cliAddr,
 		"-rtmpAddr", rtmpAddr,
 		"-datadir", t.TempDir(),
 		"-startupAvailabilityCheck=false",
-	)
+	}
+	if proxyURLTemplate != "" {
+		args = append(args, "-liveRunnerProxyUrl", proxyURLTemplate)
+	}
+	if options.staticConfigPath != "" {
+		args = append(args, "-liveRunnerConfig", options.staticConfigPath)
+	}
+	cmd := exec.CommandContext(ctx, livepeerBin, args...)
 	cmd.Dir = goLivepeerDir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -626,10 +849,11 @@ func startOffchainOrchestrator(t *testing.T) *testOrchestrator {
 	}()
 
 	orch := &testOrchestrator{
-		httpBase: serviceAddr,
-		cliBase:  "http://" + cliAddr,
-		cancel:   cancel,
-		logPath:  logFile.Name(),
+		httpBase:         serviceAddr,
+		cliBase:          "http://" + cliAddr,
+		proxyURLTemplate: proxyURLTemplate,
+		cancel:           cancel,
+		logPath:          logFile.Name(),
 	}
 	t.Cleanup(func() {
 		cancel()
@@ -660,6 +884,7 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 		cfg.label,
 		fmt.Sprintf("%d", cfg.capacity),
 		cfg.metadata,
+		fmt.Sprintf("%t", cfg.proxy),
 	)
 	cmd.Dir = pythonRunnerDir
 	stdin, err := cmd.StdinPipe()
@@ -731,6 +956,7 @@ func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cf
 		App:             liveRunnerApp,
 		Metadata:        cfg.metadata,
 		Mode:            cfg.mode,
+		Proxy:           cfg.proxy,
 		Capacity:        cfg.capacity,
 		Label:           cfg.label,
 		PriceInfo:       liverunner.PriceInfo{PricePerUnit: 10, PixelsPerUnit: 1, Unit: "WEI"},
@@ -901,6 +1127,19 @@ func requireDiscoveredRunner(t *testing.T, orch *testOrchestrator, runnerID stri
 	return discoveryRunner{}
 }
 
+func requireDiscoveredRunnerByMetadata(t *testing.T, orch *testOrchestrator, metadata string) discoveryRunner {
+	t.Helper()
+	for _, entry := range discover(t, orch) {
+		for _, runner := range entry.Runners {
+			if runner.Metadata == metadata {
+				return runner
+			}
+		}
+	}
+	t.Fatalf("runner with metadata %q not found in discovery", metadata)
+	return discoveryRunner{}
+}
+
 func requireRunnerCapacity(t *testing.T, runner discoveryRunner, capacity, used, available int) {
 	t.Helper()
 	require.Equal(t, capacity, runner.Capacity)
@@ -914,6 +1153,20 @@ func requireRunnerAbsent(t *testing.T, orch *testOrchestrator, runnerID string) 
 		for _, entry := range discover(t, orch) {
 			for _, runner := range entry.Runners {
 				if strings.Contains(runner.URL, "/apps/"+runnerID+"/") {
+					return false
+				}
+			}
+		}
+		return true
+	}, 2*time.Second, 25*time.Millisecond)
+}
+
+func requireRunnerMetadataAbsent(t *testing.T, orch *testOrchestrator, metadata string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		for _, entry := range discover(t, orch) {
+			for _, runner := range entry.Runners {
+				if runner.Metadata == metadata {
 					return false
 				}
 			}
@@ -939,6 +1192,13 @@ func stopSession(t *testing.T, orch *testOrchestrator, runnerID, sessionID strin
 func registerStaticRunner(t *testing.T, orch *testOrchestrator, body string, status int) {
 	t.Helper()
 	requireStatus(t, http.MethodPost, orch.cliBase+"/registerLiveRunners", strings.NewReader(body), status)
+}
+
+func registerStaticRunnerConfig(t *testing.T, orch *testOrchestrator, cfg staticRunnerConfig, status int) {
+	t.Helper()
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	requireStatus(t, http.MethodPost, orch.cliBase+"/registerLiveRunners", bytes.NewReader(data), status)
 }
 
 func requireChannelStatus(t *testing.T, endpoint, token string, status int) {

@@ -12,6 +12,7 @@ async def main():
         runner_url=sys.argv[3],
         app=sys.argv[4],
         mode=sys.argv[5],
+        proxy=sys.argv[9].lower() == "true",
         label=sys.argv[6],
         capacity=int(sys.argv[7]),
         metadata=sys.argv[8],

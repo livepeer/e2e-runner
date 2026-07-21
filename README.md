@@ -43,8 +43,8 @@ env \
 
 ## Coverage
 
-- Shared runtime implementation tests for `python-runner` and `golang-runner` covering register, application metadata discovery, capacity reporting, busy rejection, release, unregister, and post-unregister routing for persistent and single-shot modes.
-- LiveRunner server surface coverage for heartbeat authorization lifecycle, proxied session headers, session token isolation, trickle channel token authorization, and static runner registration with label routing and health-based availability.
+- Shared runtime implementation tests for `python-runner` and `golang-runner` covering registration with proxy configuration set and unset, application metadata discovery, capacity reporting, busy rejection, release, unregister, and post-unregister routing for persistent and single-shot modes.
+- LiveRunner server surface coverage for heartbeat authorization lifecycle, proxied session headers, session token isolation, trickle channel token authorization, domain proxy templates, and complete persistent/single-shot proxy matrices through startup static configuration and CLI static registration.
 - Shared session-control API tests for `python-runner` and `golang-runner` covering proxied trickle channel create/delete, public session proxy creation/forwarding, and session stop.
 - Optional on-chain price validation for python-runner runtime registration, golang-runner runtime registration, and static runner registration.
 

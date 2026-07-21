@@ -39,6 +39,17 @@ async def main():
             }
         )
 
+    async def proxy_default(request):
+        if reg is None:
+            return web.Response(text="runner not registered", status=503)
+        created = await reg.create_proxy(request)
+        return web.json_response(
+            {
+                "proxy_id": created.proxy_id,
+                "proxy_url": created.url,
+            }
+        )
+
     async def proxy_target(request):
         body = await request.text()
         return web.json_response(
@@ -60,7 +71,9 @@ async def main():
     app = web.Application()
     app.router.add_post("/channels", channels)
     app.router.add_post("/proxy", proxy)
+    app.router.add_post("/proxy-default", proxy_default)
     app.router.add_route("*", "/proxy-target/{tail:.*}", proxy_target)
+    app.router.add_route("*", "/app-proxy/{tail:.*}", proxy_target)
     app.router.add_post("/stop", stop)
 
     runner = web.AppRunner(app)
