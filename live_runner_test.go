@@ -53,6 +53,9 @@ var pythonRunnerSessionControlsScript string
 //go:embed testdata/python_runner_missing_price.py
 var pythonRunnerMissingPriceScript string
 
+//go:embed testdata/python_multi_track_media_round_trip.py
+var pythonMultiTrackMediaRoundTripScript string
+
 type testOrchestrator struct {
 	httpBase         string
 	cliBase          string
@@ -135,6 +138,20 @@ type runnerProxyResponse struct {
 type proxyCreateResponse struct {
 	ProxyID  string `json:"proxy_id"`
 	ProxyURL string `json:"proxy_url"`
+}
+
+type multiTrackMediaRoundTripResult struct {
+	ObservedVideoTracks  int                `json:"observed_video_tracks"`
+	ObservedAudioTracks  int                `json:"observed_audio_tracks"`
+	VideoFrameCounts     []int              `json:"video_frame_counts"`
+	AudioSampleCounts    []int              `json:"audio_sample_counts"`
+	VideoSignaturesOK    bool               `json:"video_signatures_ok"`
+	AudioFrequenciesOK   bool               `json:"audio_frequencies_ok"`
+	AudioFrequencyRatios map[string]float64 `json:"audio_frequency_ratios"`
+	SegmentsConsumed     int                `json:"segments_consumed"`
+	SegmentsStarted      int                `json:"segments_started"`
+	VerificationOK       bool               `json:"verification_ok"`
+	Errors               []string           `json:"errors"`
 }
 
 type proxiedTargetResponse struct {
@@ -792,6 +809,114 @@ func TestOnchainPriceInfoRequired(t *testing.T) {
 	})
 }
 
+func TestPythonRunnerMultiTrackMediaRoundTrip(t *testing.T) {
+	orch := startOffchainOrchestrator(t)
+	pythonRunnerDir := repoDir(t, envPythonRunnerDir, filepath.Join("livepeer", "python-runner"))
+	requestHeaders := make(chan http.Header, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestHeaders <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	runnerID := fmt.Sprintf("multi-track-round-trip-%d", time.Now().UnixNano())
+	registration := registerRunnerHTTP(t, orch, heartbeatPayload{
+		RunnerID:  runnerID,
+		RunnerURL: upstream.URL,
+		Status:    "ready",
+		Mode:      "persistent",
+		App:       liveRunnerApp,
+		Capacity:  1,
+		PriceInfo: priceInfo{PricePerUnit: 10, PixelsPerUnit: 1, Unit: "WEI"},
+	}, liveRunnerSecret)
+	session := reserveSession(t, orch, registration.RunnerID)
+	requireStatus(t, http.MethodPost, session.AppURL+"/bootstrap", nil, http.StatusNoContent)
+	sessionHeaders := requireReceiveHeader(t, requestHeaders)
+
+	channelName := fmt.Sprintf("multi-track-%d", time.Now().UnixNano())
+	channelEndpoint := orch.httpBase +
+		"/runner/" + url.PathEscape(registration.RunnerID) +
+		"/session/" + url.PathEscape(session.SessionID) +
+		"/channels"
+	var channels channelResponse
+	requireJSONStatus(
+		t,
+		http.MethodPost,
+		channelEndpoint,
+		map[string]any{
+			"channels": []map[string]string{{
+				"name":      channelName,
+				"mime_type": "video/MP2T",
+			}},
+		},
+		map[string]string{
+			"Livepeer-Session-Token": sessionHeaders.Get("Livepeer-Session-Token"),
+		},
+		http.StatusOK,
+		&channels,
+	)
+	require.Len(t, channels.Channels, 1)
+	publishURL := channels.Channels[0].URL
+	require.Contains(t, publishURL, orch.httpBase+"/ai/trickle/")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(
+		ctx,
+		"uv", "run", "--extra", "examples", "python", "-u", "-c",
+		pythonMultiTrackMediaRoundTripScript,
+		publishURL,
+	)
+	cmd.Dir = pythonRunnerDir
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf(
+			"python multi-track media round-trip timed out\npython stderr:\n%s\norchestrator logs:\n%s",
+			stderr.String(),
+			readLog(t, orch.logPath),
+		)
+	}
+	require.NoError(
+		t,
+		err,
+		"python multi-track media round-trip failed\npython stderr:\n%s\norchestrator logs:\n%s",
+		stderr.String(),
+		readLog(t, orch.logPath),
+	)
+
+	var result multiTrackMediaRoundTripResult
+	require.NoError(
+		t,
+		json.Unmarshal([]byte(strings.TrimSpace(stdout.String())), &result),
+		"invalid helper output %q\npython stderr:\n%s\norchestrator logs:\n%s",
+		stdout.String(),
+		stderr.String(),
+		readLog(t, orch.logPath),
+	)
+	failureMessage := strings.Join(result.Errors, "; ")
+	require.Equal(t, 2, result.ObservedVideoTracks, failureMessage)
+	require.Equal(t, 2, result.ObservedAudioTracks, failureMessage)
+	require.Len(t, result.VideoFrameCounts, 2, failureMessage)
+	require.Len(t, result.AudioSampleCounts, 2, failureMessage)
+	for _, frameCount := range result.VideoFrameCounts {
+		require.Positive(t, frameCount, failureMessage)
+	}
+	for _, sampleCount := range result.AudioSampleCounts {
+		require.Positive(t, sampleCount, failureMessage)
+	}
+	require.True(t, result.VideoSignaturesOK, failureMessage)
+	require.True(t, result.AudioFrequenciesOK, failureMessage)
+	require.GreaterOrEqual(t, result.AudioFrequencyRatios["440"], 2.5, failureMessage)
+	require.GreaterOrEqual(t, result.AudioFrequencyRatios["880"], 2.5, failureMessage)
+	require.True(t, result.VerificationOK, failureMessage)
+	require.Positive(t, result.SegmentsConsumed)
+	require.Positive(t, result.SegmentsStarted)
+}
+
 func startOffchainOrchestrator(t *testing.T, optionList ...orchestratorOptions) *testOrchestrator {
 	t.Helper()
 	require.LessOrEqual(t, len(optionList), 1)
@@ -949,6 +1074,8 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cfg runnerConfig) *goRunnerRegistration {
 	t.Helper()
 	require.NotEmpty(t, cfg.runnerURL)
+	price, err := liverunner.NewPriceInfo("10", "USD", "fixed")
+	require.NoError(t, err)
 	reg, err := liverunner.Register(ctx, liverunner.Options{
 		OrchestratorURL: orch.httpBase,
 		BootstrapSecret: liveRunnerSecret,
@@ -959,7 +1086,7 @@ func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cf
 		Proxy:           cfg.proxy,
 		Capacity:        cfg.capacity,
 		Label:           cfg.label,
-		PriceInfo:       liverunner.PriceInfo{PricePerUnit: 10, PixelsPerUnit: 1, Unit: "WEI"},
+		PriceInfo:       price,
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, reg.RunnerID())
