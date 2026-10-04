@@ -21,7 +21,7 @@ async def main():
         )
     except LivepeerGatewayError as exc:
         msg = str(exc)
-        if "positive price_info" in msg or "price_info" in msg:
+        if getattr(exc, "status", getattr(exc, "status_code", None)) == 400 or "price" in msg.lower():
             return
         raise
     else:

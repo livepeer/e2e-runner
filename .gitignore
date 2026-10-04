@@ -1,0 +1,4 @@
+artifacts/
+test.local.env
+go.work
+go.work.sum

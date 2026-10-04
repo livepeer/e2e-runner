@@ -16,9 +16,9 @@ async def main():
         label=sys.argv[6],
         capacity=int(sys.argv[7]),
         metadata=sys.argv[8],
-        price=10,
+        price=float(sys.argv[10]) if len(sys.argv) > 10 else 10,
         currency="usd",
-        unit="hour",
+        unit=sys.argv[11] if len(sys.argv) > 11 else "hour",
         auto_detect_gpu=False,
         heartbeat_interval_s=60,
     )

@@ -6,10 +6,8 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,8 +25,7 @@ import (
 )
 
 const (
-	liveRunnerSecret = "live-runner-secret"
-	liveRunnerApp    = "livepeer-sample/echo"
+	liveRunnerApp = "livepeer-sample/echo"
 
 	domainProxyURLTemplate = "http://{proxy}.localhost:{http_port}"
 )
@@ -36,11 +34,9 @@ const (
 	envGoLivepeerDir   = "GO_LIVEPEER_DIR"
 	envLivepeerBin     = "LIVEPEER_BINARY"
 	envPythonRunnerDir = "PYTHON_RUNNER_DIR"
-
-	envOnchainOrchURL = "LIVEPEER_ONCHAIN_ORCH_URL"
-	envOnchainCLIURL  = "LIVEPEER_ONCHAIN_CLI_URL"
-	envOnchainSecret  = "LIVEPEER_ONCHAIN_ORCH_SECRET"
 )
+
+var liveRunnerSecret string
 
 var testHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
@@ -57,35 +53,49 @@ var pythonRunnerMissingPriceScript string
 var pythonMultiTrackMediaRoundTripScript string
 
 type testOrchestrator struct {
+	backend          string
+	process          *childProcess
 	httpBase         string
 	cliBase          string
 	proxyURLTemplate string
-	cancel           context.CancelFunc
 	logPath          string
+	dir              string
+	opts             orchestratorOptions
 }
 
 type orchestratorOptions struct {
+	backend          string
+	account          *chainAccount
+	chain            *chainFixture
 	proxyURLTemplate string
 	staticConfigPath string
+	dir              string
+	extra            map[string]any
+	noReady          bool
+	useOracle        bool
+	goExtra          []string
 }
 
 type heartbeatPayload struct {
-	RunnerID  string    `json:"runner_id,omitempty"`
-	Label     string    `json:"label,omitempty"`
-	RunnerURL string    `json:"runner_url"`
-	Version   string    `json:"version,omitempty"`
-	Metadata  string    `json:"metadata,omitempty"`
-	Status    string    `json:"status,omitempty"`
-	Mode      string    `json:"mode,omitempty"`
-	App       string    `json:"app"`
-	Capacity  int       `json:"capacity"`
-	PriceInfo priceInfo `json:"price_info"`
+	GPU       map[string]any `json:"gpu,omitempty"`
+	RunnerID  string         `json:"runner_id,omitempty"`
+	Label     string         `json:"label,omitempty"`
+	Proxy     bool           `json:"proxy,omitempty"`
+	RunnerURL string         `json:"runner_url"`
+	Version   string         `json:"version,omitempty"`
+	Metadata  string         `json:"metadata,omitempty"`
+	Status    string         `json:"status,omitempty"`
+	Mode      string         `json:"mode,omitempty"`
+	App       string         `json:"app"`
+	Capacity  int            `json:"capacity"`
+	PriceInfo priceInfo      `json:"price_info"`
 }
 
 type priceInfo struct {
-	PricePerUnit  int64  `json:"price_per_unit"`
-	PixelsPerUnit int64  `json:"pixels_per_unit"`
-	Unit          string `json:"unit,omitempty"`
+	Price    json.Number `json:"price,omitempty"`
+	PriceUSD json.Number `json:"price_usd,omitempty"`
+	Currency string      `json:"currency,omitempty"`
+	Unit     string      `json:"unit,omitempty"`
 }
 
 type heartbeatResponse struct {
@@ -165,6 +175,7 @@ type proxiedTargetResponse struct {
 }
 
 type runnerConfig struct {
+	price     priceInfo
 	runnerURL string
 	mode      string
 	label     string
@@ -226,7 +237,7 @@ type pythonRunner struct {
 	stdin           io.Closer
 	cancel          context.CancelFunc
 	done            <-chan error
-	stderr          *bytes.Buffer
+	stderr          *lockedBuffer
 }
 
 type goRunnerRegistration struct {
@@ -264,7 +275,7 @@ func (goRunnerImplementation) Start(t *testing.T, ctx context.Context, orch *tes
 func (goRunnerImplementation) StartSessionControlRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cfg runnerConfig) runnerRegistration {
 	var reg *liverunner.Runner
 	var upstream *httptest.Server
-	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream = newFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if reg == nil {
 			http.Error(w, "runner not registered", http.StatusServiceUnavailable)
 			return
@@ -353,7 +364,7 @@ func newRunnerUpstream(t *testing.T, capacity int) *runnerUpstream {
 		entered: make(chan struct{}, capacity+1),
 		release: make(chan struct{}),
 	}
-	upstream.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream.server = newFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -424,10 +435,14 @@ func runPersistentRunnerLifecycle(t *testing.T, orch *testOrchestrator, route st
 	requirePersistentAppURL(t, orch, route, s2, cfg.proxy)
 	requireStatus(t, http.MethodPost, s1.AppURL+"/check", strings.NewReader("x"), http.StatusOK)
 
-	requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, cfg.capacity, 0)
-	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(route)+"/session", nil, http.StatusServiceUnavailable)
+	t.Run("full capacity discovery", func(t *testing.T) {
+		requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, cfg.capacity, 0)
+	})
+	t.Run("busy rejection", func(t *testing.T) {
+		requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(route)+"/session", nil, http.StatusServiceUnavailable)
+	})
 
-	stopSession(t, orch, route, s1.SessionID)
+	t.Run("stop response", func(t *testing.T) { stopSession(t, orch, route, s1.SessionID) })
 	requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, cfg.capacity-1, 1)
 	s3 := reserveSession(t, orch, route)
 	require.NotEmpty(t, s3.SessionID)
@@ -463,8 +478,12 @@ func runSingleShotRunnerLifecycle(t *testing.T, orch *testOrchestrator, route st
 		}()
 	}
 	requireReceiveN(t, upstream.entered, cfg.capacity)
-	requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, cfg.capacity, 0)
-	requireStatus(t, http.MethodPost, runner.URL+"/blocked", strings.NewReader("x"), http.StatusServiceUnavailable)
+	t.Run("full capacity discovery", func(t *testing.T) {
+		requireRunnerCapacity(t, requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata), cfg.capacity, cfg.capacity, 0)
+	})
+	t.Run("busy rejection", func(t *testing.T) {
+		requireStatus(t, http.MethodPost, runner.URL+"/blocked", strings.NewReader("x"), http.StatusServiceUnavailable)
+	})
 	upstream.releaseRequests()
 	wg.Wait()
 	close(errs)
@@ -494,6 +513,10 @@ func requireDomainProxyURL(t *testing.T, orch *testOrchestrator, rawURL, route s
 }
 
 func TestDynamicRunnerProxyRegistration(t *testing.T) {
+	forEachOrchestrator(t, runDynamicRunnerProxyRegistration)
+}
+
+func runDynamicRunnerProxyRegistration(t *testing.T) {
 	orch := startOffchainOrchestrator(t, orchestratorOptions{proxyURLTemplate: domainProxyURLTemplate})
 	ctx := context.Background()
 
@@ -523,6 +546,10 @@ func TestDynamicRunnerProxyRegistration(t *testing.T) {
 }
 
 func TestStaticRunnerProxyConfiguration(t *testing.T) {
+	forEachOrchestrator(t, runStaticRunnerProxyConfiguration)
+}
+
+func runStaticRunnerProxyConfiguration(t *testing.T) {
 	t.Run("startup config", func(t *testing.T) {
 		cfg, scenarios := newStaticRunnerMatrix(t, "startup-static")
 		data, err := json.Marshal(cfg)
@@ -575,7 +602,7 @@ func newStaticRunnerMatrix(t *testing.T, prefix string) (staticRunnerConfig, []s
 				Metadata:  metadata,
 				Mode:      mode,
 				Capacity:  2,
-				PriceInfo: priceInfo{PricePerUnit: 10, PixelsPerUnit: 1, Unit: "WEI"},
+				PriceInfo: priceInfo{Price: "10", Currency: "usd", Unit: "fixed"},
 				HealthURL: upstream.server.URL + "/health",
 			})
 			scenarios = append(scenarios, staticRunnerScenario{
@@ -599,7 +626,9 @@ func runStaticRunnerMatrix(t *testing.T, orch *testOrchestrator, scenarios []sta
 	}
 }
 
-func TestLiveRunnerServerSurface(t *testing.T) {
+func TestLiveRunnerServerSurface(t *testing.T) { forEachOrchestrator(t, runLiveRunnerServerSurface) }
+
+func runLiveRunnerServerSurface(t *testing.T) {
 	orch := startOffchainOrchestrator(t)
 
 	t.Run("heartbeat auth lifecycle", func(t *testing.T) {
@@ -611,7 +640,7 @@ func TestLiveRunnerServerSurface(t *testing.T) {
 			Mode:      "persistent",
 			App:       liveRunnerApp,
 			Capacity:  1,
-			PriceInfo: priceInfo{PricePerUnit: 10, PixelsPerUnit: 1, Unit: "WEI"},
+			PriceInfo: priceInfo{Price: "10", Currency: "usd", Unit: "fixed"},
 		}
 		resp := registerRunnerHTTP(t, orch, payload, liveRunnerSecret)
 		payload.Capacity = 2
@@ -626,7 +655,7 @@ func TestLiveRunnerServerSurface(t *testing.T) {
 
 	t.Run("proxy headers and session token isolation", func(t *testing.T) {
 		headersCh := make(chan http.Header, 2)
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstream := newFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			headersCh <- r.Header.Clone()
 			_, _ = w.Write([]byte("ok"))
 		}))
@@ -639,7 +668,7 @@ func TestLiveRunnerServerSurface(t *testing.T) {
 			Mode:      "persistent",
 			App:       liveRunnerApp,
 			Capacity:  2,
-			PriceInfo: priceInfo{PricePerUnit: 10, PixelsPerUnit: 1, Unit: "WEI"},
+			PriceInfo: priceInfo{Price: "10", Currency: "usd", Unit: "fixed"},
 		}, liveRunnerSecret)
 		s1 := reserveSession(t, orch, resp.RunnerID)
 		s2 := reserveSession(t, orch, resp.RunnerID)
@@ -663,9 +692,10 @@ func TestLiveRunnerServerSurface(t *testing.T) {
 	})
 
 	t.Run("static health and label routing", func(t *testing.T) {
-		healthy := true
-		healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if healthy {
+		var healthy atomic.Bool
+		healthy.Store(true)
+		healthSrv := newFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if healthy.Load() {
 				w.WriteHeader(http.StatusOK)
 				return
 			}
@@ -673,7 +703,10 @@ func TestLiveRunnerServerSurface(t *testing.T) {
 		}))
 		defer healthSrv.Close()
 
-		registerStaticRunner(t, orch, fmt.Sprintf(`{"runners":[{"label":"static-echo","routing":"label","runner_url":"http://runner.invalid","app":%q,"metadata":"static application metadata","mode":"persistent","capacity":1,"price_info":{"price_per_unit":10,"pixels_per_unit":1,"unit":"WEI"},"health_url":%q}]}`, liveRunnerApp, healthSrv.URL), http.StatusOK)
+		cfg := staticRunnerConfig{Runners: []staticRunnerConfigEntry{{Label: "static-echo", Routing: "label", RunnerURL: "http://runner.invalid", App: liveRunnerApp, Metadata: "static application metadata", Mode: "persistent", Capacity: 1, PriceInfo: priceInfo{Price: "10", Currency: "usd", Unit: "fixed"}, HealthURL: healthSrv.URL}}}
+		path := writeStaticConfig(t, cfg)
+		orch := startOffchainOrchestrator(t, orchestratorOptions{staticConfigPath: path})
+		waitDiscovered(t, orch, "static application metadata")
 		runner := requireDiscoveredRunner(t, orch, "static-echo")
 		require.Contains(t, runner.URL, "/apps/static-echo/session")
 		require.Equal(t, "static application metadata", runner.Metadata)
@@ -681,14 +714,16 @@ func TestLiveRunnerServerSurface(t *testing.T) {
 		session := reserveSession(t, orch, "static-echo")
 		require.NotEmpty(t, session.SessionID)
 
-		healthy = false
-		registerStaticRunner(t, orch, fmt.Sprintf(`{"runners":[{"label":"static-echo","routing":"label","runner_url":"http://runner.invalid","app":%q,"metadata":"static application metadata","mode":"persistent","capacity":1,"price_info":{"price_per_unit":10,"pixels_per_unit":1,"unit":"WEI"},"health_url":%q}]}`, liveRunnerApp, healthSrv.URL), http.StatusOK)
+		healthy.Store(false)
+
 		requireRunnerAbsent(t, orch, "static-echo")
 		requireStatus(t, http.MethodPost, orch.httpBase+"/apps/static-echo/session", nil, http.StatusNotFound)
 	})
 }
 
-func TestRunnerSessionControlAPIs(t *testing.T) {
+func TestRunnerSessionControlAPIs(t *testing.T) { forEachOrchestrator(t, runRunnerSessionControlAPIs) }
+
+func runRunnerSessionControlAPIs(t *testing.T) {
 	orch := startOffchainOrchestrator(t)
 	ctx := context.Background()
 
@@ -706,9 +741,11 @@ func TestRunnerSessionControlAPIs(t *testing.T) {
 			require.Equal(t, orch.httpBase, reg.OrchestratorURL())
 
 			session := reserveSession(t, orch, runnerID)
-			discovered := requireDiscoveredRunner(t, orch, runnerID)
-			require.Equal(t, cfg.metadata, discovered.Metadata)
-			requireRunnerCapacity(t, discovered, 1, 1, 0)
+			t.Run("full capacity discovery", func(t *testing.T) {
+				discovered := requireDiscoveredRunner(t, orch, runnerID)
+				require.Equal(t, cfg.metadata, discovered.Metadata)
+				requireRunnerCapacity(t, discovered, 1, 1, 0)
+			})
 
 			var proxyResp runnerProxyResponse
 			requireJSONStatus(t, http.MethodPost, session.AppURL+"/channels", nil, nil, http.StatusOK, &proxyResp)
@@ -766,60 +803,28 @@ func TestRunnerSessionControlAPIs(t *testing.T) {
 	}
 }
 
-func TestOnchainPriceInfoRequired(t *testing.T) {
-	orchURL := strings.TrimRight(os.Getenv(envOnchainOrchURL), "/")
-	secret := os.Getenv(envOnchainSecret)
-	if orchURL == "" || secret == "" {
-		t.Skipf("set %s and %s to run optional on-chain price_info e2e", envOnchainOrchURL, envOnchainSecret)
-	}
-	orch := &testOrchestrator{
-		httpBase: orchURL,
-		cliBase:  strings.TrimRight(os.Getenv(envOnchainCLIURL), "/"),
-	}
-
-	t.Run("python-runner runtime runner without price fails", func(t *testing.T) {
-		runPythonRunnerMissingPrice(t, orch, secret, "http://runner.invalid", "persistent", "py-onchain-no-price")
-	})
-
-	t.Run("golang-runner runtime runner without price fails", func(t *testing.T) {
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte("ok"))
-		}))
-		defer upstream.Close()
-
-		_, err := liverunner.Register(context.Background(), liverunner.Options{
-			OrchestratorURL: orch.httpBase,
-			BootstrapSecret: secret,
-			RunnerURL:       upstream.URL,
-			App:             liveRunnerApp,
-			Mode:            liverunner.ModePersistent,
-			Capacity:        1,
-			Label:           "go-onchain-no-price",
-		})
-		requirePriceInfoError(t, err)
-	})
-
-	t.Run("static runner without price fails", func(t *testing.T) {
-		if orch.cliBase == "" {
-			t.Skipf("set %s to run optional static runner on-chain price_info e2e", envOnchainCLIURL)
-		}
-		body := fmt.Sprintf(`{"runners":[{"label":"static-onchain-no-price","routing":"label","runner_url":"http://runner.invalid","app":%q,"mode":"persistent","capacity":1,"health_url":"http://runner.invalid/health"}]}`, liveRunnerApp)
-		respBody := requireStatusBody(t, http.MethodPost, orch.cliBase+"/registerLiveRunners", strings.NewReader(body), http.StatusBadRequest)
-		require.Contains(t, respBody, "price_info")
-	})
+func TestPythonRunnerMultiTrackMediaRoundTrip(t *testing.T) {
+	forEachOrchestrator(t, runPythonRunnerMultiTrackMediaRoundTrip)
 }
 
-func TestPythonRunnerMultiTrackMediaRoundTrip(t *testing.T) {
-	orch := startOffchainOrchestrator(t)
-	pythonRunnerDir := repoDir(t, envPythonRunnerDir, filepath.Join("livepeer", "python-runner"))
+func runPythonRunnerMultiTrackMediaRoundTrip(t *testing.T) {
+	runMediaRoundTrip(t, startOffchainOrchestrator(t), nil)
+}
+
+func runMediaRoundTrip(t *testing.T, orch *testOrchestrator, signer *testSigner) {
+	pythonRunnerDir := repoDir(t, envPythonRunnerDir)
 	requestHeaders := make(chan http.Header, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := newFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestHeaders <- r.Header.Clone()
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
 
 	runnerID := fmt.Sprintf("multi-track-round-trip-%d", time.Now().UnixNano())
+	price := priceInfo{Price: "10", Currency: "usd", Unit: "fixed"}
+	if signer != nil {
+		price.Price = "0.001"
+	}
 	registration := registerRunnerHTTP(t, orch, heartbeatPayload{
 		RunnerID:  runnerID,
 		RunnerURL: upstream.URL,
@@ -827,9 +832,23 @@ func TestPythonRunnerMultiTrackMediaRoundTrip(t *testing.T) {
 		Mode:      "persistent",
 		App:       liveRunnerApp,
 		Capacity:  1,
-		PriceInfo: priceInfo{PricePerUnit: 10, PixelsPerUnit: 1, Unit: "WEI"},
+		PriceInfo: price,
 	}, liveRunnerSecret)
-	session := reserveSession(t, orch, registration.RunnerID)
+	var session sessionResponse
+	if signer == nil {
+		session = reserveSession(t, orch, registration.RunnerID)
+	} else {
+		j := &paymentJob{signer: signer, orch: orch, route: registration.RunnerID, mode: "persistent", unit: "fixed", app: liveRunnerApp}
+		j.obtainChallenge(t)
+		j.sign(t, nil)
+		status, body := httpJSON(t, "POST", j.target(), nil, j.headers())
+		require.Equal(t, 200, status, string(body))
+		require.NoError(t, json.Unmarshal(body, &session))
+		t.Cleanup(func() {
+			stopPaidSession(t, orch, registration.RunnerID, session.SessionID)
+			unregisterPaidRunner(t, orch, registration.RunnerID, registration.HeartbeatSecret)
+		})
+	}
 	requireStatus(t, http.MethodPost, session.AppURL+"/bootstrap", nil, http.StatusNoContent)
 	sessionHeaders := requireReceiveHeader(t, requestHeaders)
 
@@ -859,11 +878,11 @@ func TestPythonRunnerMultiTrackMediaRoundTrip(t *testing.T) {
 	publishURL := channels.Channels[0].URL
 	require.Contains(t, publishURL, orch.httpBase+"/ai/trickle/")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_MEDIA_TIMEOUT", "40s"))
 	defer cancel()
 	cmd := exec.CommandContext(
 		ctx,
-		"uv", "run", "--extra", "examples", "python", "-u", "-c",
+		"uv", "run", "--frozen", "--extra", "examples", "python", "-u", "-c",
 		pythonMultiTrackMediaRoundTripScript,
 		publishURL,
 	)
@@ -924,83 +943,15 @@ func startOffchainOrchestrator(t *testing.T, optionList ...orchestratorOptions) 
 	if len(optionList) == 1 {
 		options = optionList[0]
 	}
-	goLivepeerDir := repoDir(t, envGoLivepeerDir, "go-livepeer")
-	livepeerBin := os.Getenv(envLivepeerBin)
-	if livepeerBin == "" {
-		livepeerBin = filepath.Join(goLivepeerDir, "livepeer")
-	}
-	httpAddr := freeAddr(t)
-	cliAddr := freeAddr(t)
-	rtmpAddr := freeAddr(t)
-	serviceAddr := "http://" + httpAddr
-	ctx, cancel := context.WithCancel(context.Background())
-	proxyURLTemplate := ""
-	if options.proxyURLTemplate != "" {
-		_, httpPort, err := net.SplitHostPort(httpAddr)
-		require.NoError(t, err)
-		proxyURLTemplate = strings.ReplaceAll(options.proxyURLTemplate, "{http_port}", httpPort)
-	}
-
-	logFile, err := os.Create(filepath.Join(t.TempDir(), "livepeer.log"))
-	require.NoError(t, err)
-	args := []string{
-		"-network", "offchain",
-		"-orchestrator",
-		"-orchSecret", liveRunnerSecret,
-		"-useLiveRunners",
-		"-serviceAddr", serviceAddr,
-		"-httpAddr", "http://" + httpAddr,
-		"-cliAddr", cliAddr,
-		"-rtmpAddr", rtmpAddr,
-		"-datadir", t.TempDir(),
-		"-startupAvailabilityCheck=false",
-	}
-	if proxyURLTemplate != "" {
-		args = append(args, "-liveRunnerProxyUrl", proxyURLTemplate)
-	}
-	if options.staticConfigPath != "" {
-		args = append(args, "-liveRunnerConfig", options.staticConfigPath)
-	}
-	cmd := exec.CommandContext(ctx, livepeerBin, args...)
-	cmd.Dir = goLivepeerDir
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-
-	require.NoError(t, cmd.Start())
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-		close(done)
-	}()
-
-	orch := &testOrchestrator{
-		httpBase:         serviceAddr,
-		cliBase:          "http://" + cliAddr,
-		proxyURLTemplate: proxyURLTemplate,
-		cancel:           cancel,
-		logPath:          logFile.Name(),
-	}
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-		}
-		_ = logFile.Close()
-	})
-	waitForHTTP(t, orch.cliBase+"/status", http.StatusOK, orch.logPath)
-	waitForHTTP(t, orch.httpBase+"/discovery", http.StatusOK, orch.logPath)
-	return orch
+	return startOrchestrator(t, options)
 }
 
 func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *testOrchestrator, cfg runnerConfig) *pythonRunner {
 	t.Helper()
 	runCtx, cancel := context.WithCancel(ctx)
-	pythonRunnerDir := repoDir(t, envPythonRunnerDir, filepath.Join("livepeer", "python-runner"))
+	pythonRunnerDir := repoDir(t, envPythonRunnerDir)
 	cmd := exec.CommandContext(runCtx,
-		"uv", "run", "python", "-u", "-c", script,
+		"uv", "run", "--frozen", "python", "-u", "-c", script,
 		orch.httpBase,
 		liveRunnerSecret,
 		cfg.runnerURL,
@@ -1010,13 +961,14 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 		fmt.Sprintf("%d", cfg.capacity),
 		cfg.metadata,
 		fmt.Sprintf("%t", cfg.proxy),
+		string(runnerPrice(cfg).Price), runnerPrice(cfg).Unit, fixturePort(t),
 	)
 	cmd.Dir = pythonRunnerDir
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
 	stdout, err := cmd.StdoutPipe()
 	require.NoError(t, err)
-	stderr := &bytes.Buffer{}
+	stderr := &lockedBuffer{}
 	cmd.Stderr = stderr
 
 	require.NoError(t, cmd.Start())
@@ -1041,7 +993,7 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 	case result := <-lineCh:
 		require.NoError(t, result.err, stderr.String())
 		line = result.line
-	case <-time.After(10 * time.Second):
+	case <-time.After(envDuration(t, "E2E_READY_TIMEOUT", "30s")):
 		cancel()
 		<-done
 		t.Fatalf("timed out waiting for python-runner registration: %s", stderr.String())
@@ -1074,7 +1026,7 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cfg runnerConfig) *goRunnerRegistration {
 	t.Helper()
 	require.NotEmpty(t, cfg.runnerURL)
-	price, err := liverunner.NewPriceInfo("10", "USD", "fixed")
+	price, err := liverunner.NewPriceInfo(string(runnerPrice(cfg).Price), "USD", runnerPrice(cfg).Unit)
 	require.NoError(t, err)
 	reg, err := liverunner.Register(ctx, liverunner.Options{
 		OrchestratorURL: orch.httpBase,
@@ -1102,11 +1054,11 @@ func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cf
 
 func runPythonRunnerMissingPrice(t *testing.T, orch *testOrchestrator, secret, runnerURL, mode, label string) {
 	t.Helper()
-	pythonRunnerDir := repoDir(t, envPythonRunnerDir, filepath.Join("livepeer", "python-runner"))
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	pythonRunnerDir := repoDir(t, envPythonRunnerDir)
+	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_JOB_TIMEOUT", "30s"))
 	defer cancel()
 	cmd := exec.CommandContext(ctx,
-		"uv", "run", "python", "-u", "-c", pythonRunnerMissingPriceScript,
+		"uv", "run", "--frozen", "python", "-u", "-c", pythonRunnerMissingPriceScript,
 		orch.httpBase,
 		secret,
 		runnerURL,
@@ -1122,30 +1074,6 @@ func runPythonRunnerMissingPrice(t *testing.T, orch *testOrchestrator, secret, r
 	require.NoError(t, err, string(output))
 }
 
-func requirePriceInfoError(t *testing.T, err error) {
-	t.Helper()
-	var httpErr *liverunner.HTTPError
-	require.Error(t, err)
-	require.True(t, errors.As(err, &httpErr), "expected *liverunner.HTTPError, got %T: %v", err, err)
-	require.Equal(t, http.StatusBadRequest, httpErr.StatusCode)
-	require.Contains(t, httpErr.Body, "price_info")
-}
-
-func repoDir(t *testing.T, envName, defaultRel string, fallbackEnvNames ...string) string {
-	t.Helper()
-	if dir := os.Getenv(envName); dir != "" {
-		return dir
-	}
-	for _, fallbackEnvName := range fallbackEnvNames {
-		if dir := os.Getenv(fallbackEnvName); dir != "" {
-			return dir
-		}
-	}
-	home, err := os.UserHomeDir()
-	require.NoError(t, err)
-	return filepath.Join(home, defaultRel)
-}
-
 func (r *pythonRunner) RunnerID() string {
 	return r.runnerID
 }
@@ -1155,11 +1083,6 @@ func (r *pythonRunner) OrchestratorURL() string {
 }
 
 func (r *pythonRunner) Close(t *testing.T) {
-	t.Helper()
-	r.close(t)
-}
-
-func (r *pythonRunner) close(t *testing.T) {
 	t.Helper()
 	if r.stdin == nil {
 		return
@@ -1189,25 +1112,19 @@ func (r *goRunnerRegistration) Close(t *testing.T) {
 	require.NoError(t, r.reg.Close(r.ctx))
 }
 
-func freeAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer ln.Close()
-	return ln.Addr().String()
-}
+func freeAddr(t *testing.T) string { t.Helper(); return fixturePoolFor(t).take(t) }
 
-func waitForHTTP(t *testing.T, target string, status int, logPath string) {
+func waitForHTTP(t *testing.T, method, target string, status int, logPath string) {
 	t.Helper()
-	require.Eventuallyf(t, func() bool {
-		resp, err := testHTTPClient.Get(target)
-		if err != nil {
-			return false
+	deadline := time.Now().Add(envDuration(t, "E2E_READY_TIMEOUT", "30s"))
+	for time.Now().Before(deadline) {
+		got, _, err := requestHTTP(method, target, nil, nil)
+		if err == nil && got == status {
+			return
 		}
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return resp.StatusCode == status
-	}, 10*time.Second, 50*time.Millisecond, "waiting for %s\n%s", target, readLog(t, logPath))
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("INFRASTRUCTURE: waiting for %s\n%s", target, readLog(t, logPath))
 }
 
 func registerRunnerHTTP(t *testing.T, orch *testOrchestrator, payload heartbeatPayload, auth string) heartbeatResponse {
@@ -1224,14 +1141,7 @@ func requireHeartbeatStatus(t *testing.T, orch *testOrchestrator, payload heartb
 
 func unregisterRunner(t *testing.T, orch *testOrchestrator, runnerID, auth string, status int) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, orch.httpBase+"/runners/"+url.PathEscape(runnerID)+"/unregister", nil)
-	require.NoError(t, err)
-	req.Header.Set("Authorization", auth)
-	resp, err := testHTTPClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	require.Equal(t, status, resp.StatusCode, string(body))
+	requireJSONStatus(t, http.MethodPost, orch.httpBase+"/runners/"+url.PathEscape(runnerID)+"/unregister", nil, map[string]string{"Authorization": auth}, status, nil)
 }
 
 func discover(t *testing.T, orch *testOrchestrator) []discoveryEntry {
@@ -1241,30 +1151,30 @@ func discover(t *testing.T, orch *testOrchestrator) []discoveryEntry {
 	return entries
 }
 
-func requireDiscoveredRunner(t *testing.T, orch *testOrchestrator, runnerID string) discoveryRunner {
+func findRunner(t *testing.T, orch *testOrchestrator, matches func(discoveryRunner) bool) *discoveryRunner {
 	t.Helper()
 	for _, entry := range discover(t, orch) {
 		for _, runner := range entry.Runners {
-			if strings.Contains(runner.URL, "/apps/"+runnerID+"/") {
-				return runner
+			if matches(runner) {
+				return &runner
 			}
 		}
 	}
-	t.Fatalf("runner %q not found in discovery", runnerID)
-	return discoveryRunner{}
+	return nil
+}
+
+func requireDiscoveredRunner(t *testing.T, orch *testOrchestrator, runnerID string) discoveryRunner {
+	t.Helper()
+	runner := findRunner(t, orch, func(r discoveryRunner) bool { return strings.Contains(r.URL, "/apps/"+runnerID+"/") })
+	require.NotNil(t, runner, "runner %q not found in discovery", runnerID)
+	return *runner
 }
 
 func requireDiscoveredRunnerByMetadata(t *testing.T, orch *testOrchestrator, metadata string) discoveryRunner {
 	t.Helper()
-	for _, entry := range discover(t, orch) {
-		for _, runner := range entry.Runners {
-			if runner.Metadata == metadata {
-				return runner
-			}
-		}
-	}
-	t.Fatalf("runner with metadata %q not found in discovery", metadata)
-	return discoveryRunner{}
+	runner := findRunner(t, orch, func(r discoveryRunner) bool { return r.Metadata == metadata })
+	require.NotNil(t, runner, "runner with metadata %q not found in discovery", metadata)
+	return *runner
 }
 
 func requireRunnerCapacity(t *testing.T, runner discoveryRunner, capacity, used, available int) {
@@ -1276,30 +1186,16 @@ func requireRunnerCapacity(t *testing.T, runner discoveryRunner, capacity, used,
 
 func requireRunnerAbsent(t *testing.T, orch *testOrchestrator, runnerID string) {
 	t.Helper()
-	require.Eventually(t, func() bool {
-		for _, entry := range discover(t, orch) {
-			for _, runner := range entry.Runners {
-				if strings.Contains(runner.URL, "/apps/"+runnerID+"/") {
-					return false
-				}
-			}
-		}
-		return true
-	}, 2*time.Second, 25*time.Millisecond)
+	eventually(t, func() bool {
+		return findRunner(t, orch, func(r discoveryRunner) bool { return strings.Contains(r.URL, "/apps/"+runnerID+"/") }) == nil
+	}, 5*time.Second, 25*time.Millisecond)
 }
 
 func requireRunnerMetadataAbsent(t *testing.T, orch *testOrchestrator, metadata string) {
 	t.Helper()
-	require.Eventually(t, func() bool {
-		for _, entry := range discover(t, orch) {
-			for _, runner := range entry.Runners {
-				if runner.Metadata == metadata {
-					return false
-				}
-			}
-		}
-		return true
-	}, 2*time.Second, 25*time.Millisecond)
+	eventually(t, func() bool {
+		return findRunner(t, orch, func(r discoveryRunner) bool { return r.Metadata == metadata }) == nil
+	}, 5*time.Second, 25*time.Millisecond)
 }
 
 func reserveSession(t *testing.T, orch *testOrchestrator, runnerID string) sessionResponse {
@@ -1316,11 +1212,6 @@ func stopSession(t *testing.T, orch *testOrchestrator, runnerID, sessionID strin
 	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/session/"+url.PathEscape(sessionID)+"/stop", nil, http.StatusNoContent)
 }
 
-func registerStaticRunner(t *testing.T, orch *testOrchestrator, body string, status int) {
-	t.Helper()
-	requireStatus(t, http.MethodPost, orch.cliBase+"/registerLiveRunners", strings.NewReader(body), status)
-}
-
 func registerStaticRunnerConfig(t *testing.T, orch *testOrchestrator, cfg staticRunnerConfig, status int) {
 	t.Helper()
 	data, err := json.Marshal(cfg)
@@ -1331,15 +1222,9 @@ func registerStaticRunnerConfig(t *testing.T, orch *testOrchestrator, cfg static
 func requireChannelStatus(t *testing.T, endpoint, token string, status int) {
 	t.Helper()
 	body := `{"channels":[{"name":"events","mime_type":"application/json"}]}`
-	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
+	got, payload, err := requestHTTP(http.MethodPost, endpoint, strings.NewReader(body), map[string]string{"Content-Type": "application/json", "Livepeer-Session-Token": token})
 	require.NoError(t, err)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Livepeer-Session-Token", token)
-	resp, err := testHTTPClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	payload, _ := io.ReadAll(resp.Body)
-	require.Equal(t, status, resp.StatusCode, string(payload))
+	require.Equal(t, status, got, string(payload))
 	if status == http.StatusOK {
 		var decoded channelResponse
 		require.NoError(t, json.Unmarshal(payload, &decoded))
@@ -1349,25 +1234,9 @@ func requireChannelStatus(t *testing.T, endpoint, token string, status int) {
 
 func requireJSONStatus(t *testing.T, method, target string, payload any, headers map[string]string, status int, out any) {
 	t.Helper()
-	var body io.Reader
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		require.NoError(t, err)
-		body = bytes.NewReader(data)
-	}
-	req, err := http.NewRequest(method, target, body)
+	got, data, err := requestHTTP(method, target, payload, headers)
 	require.NoError(t, err)
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := testHTTPClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	require.Equal(t, status, resp.StatusCode, string(data))
+	require.Equal(t, status, got, string(data))
 	if out != nil {
 		require.NoError(t, json.Unmarshal(data, out), string(data))
 	}
@@ -1388,26 +1257,13 @@ func requireStatus(t *testing.T, method, target string, body io.Reader, status i
 	require.NoError(t, err)
 }
 
-func requireStatusBody(t *testing.T, method, target string, body io.Reader, status int) string {
-	t.Helper()
-	data, err := checkStatus(method, target, body, status)
-	require.NoError(t, err)
-	return data
-}
-
 func checkStatus(method, target string, body io.Reader, status int) (string, error) {
-	req, err := http.NewRequest(method, target, body)
+	got, data, err := requestHTTP(method, target, body, nil)
 	if err != nil {
 		return "", err
 	}
-	resp, err := testHTTPClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != status {
-		return "", fmt.Errorf("expected status %d, got %d: %s", status, resp.StatusCode, string(data))
+	if got != status {
+		return "", fmt.Errorf("expected status %d, got %d: %s", status, got, data)
 	}
 	return string(data), nil
 }

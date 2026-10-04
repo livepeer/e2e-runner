@@ -78,7 +78,7 @@ async def main():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
+    site = web.TCPSite(runner, "127.0.0.1", int(sys.argv[12]) if len(sys.argv)>12 else 0)
     await site.start()
     sockets = site._server.sockets
     port = sockets[0].getsockname()[1]
@@ -94,9 +94,9 @@ async def main():
             label=sys.argv[6],
             capacity=int(sys.argv[7]),
             metadata=sys.argv[8],
-            price=10,
+            price=float(sys.argv[10]) if len(sys.argv) > 10 else 10,
             currency="usd",
-            unit="hour",
+            unit=sys.argv[11] if len(sys.argv) > 11 else "hour",
             auto_detect_gpu=False,
             heartbeat_interval_s=60,
         )

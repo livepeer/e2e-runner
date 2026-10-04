@@ -1,0 +1,640 @@
+{
+  "controller": [
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "_id",
+          "type": "bytes32"
+        }
+      ],
+      "name": "getContract",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "livepeerToken": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "spender",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "approve",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "balanceOf",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "transfer",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "bondingManager": [
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_amount",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "_to",
+          "type": "address"
+        }
+      ],
+      "name": "bond",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getFirstTranscoderInPool",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_transcoder",
+          "type": "address"
+        }
+      ],
+      "name": "getNextTranscoderInPool",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_transcoder",
+          "type": "address"
+        }
+      ],
+      "name": "getDelegator",
+      "outputs": [
+        {"name": "bondedAmount", "type": "uint256"},
+        {"name": "fees", "type": "uint256"},
+        {"name": "delegateAddress", "type": "address"},
+        {"name": "delegatedAmount", "type": "uint256"},
+        {"name": "startRound", "type": "uint256"},
+        {"name": "lastClaimRound", "type": "uint256"},
+        {"name": "nextUnbondingLockId", "type": "uint256"}
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {"name": "_transcoder", "type": "address"}
+      ],
+      "name": "getTranscoder",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "lastRewardRound",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "rewardCut",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "feeShare",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "lastActiveStakeUpdateRound",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "activationRound",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "deactivationRound",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "activeCumulativeRewards",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "cumulativeRewards",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "cumulativeFees",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "lastFeeRound",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getTranscoderPoolSize",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_transcoder",
+          "type": "address"
+        }
+      ],
+      "name": "isActiveTranscoder",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_rewardCut",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_feeShare",
+          "type": "uint256"
+        }
+      ],
+      "name": "transcoder",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "reward",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_transcoder",
+          "type": "address"
+        }
+      ],
+      "name": "transcoderTotalStake",
+      "outputs": [
+        {
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getTranscoderPoolMaxSize",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "roundsManager": [
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_round",
+          "type": "uint256"
+        }
+      ],
+      "name": "blockHashForRound",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "currentRoundStartBlock",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "currentRound",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "currentRoundInitialized",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "initializeRound",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "lastInitializedRound",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "roundLength",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "currentRoundLocked",
+      "outputs": [
+        {
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "ticketBroker": [
+    {
+      "inputs": [],
+      "name": "cancelUnlock",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_reserveHolder",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "_claimant",
+          "type": "address"
+        }
+      ],
+      "name": "claimableReserve",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_depositAmount",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_reserveAmount",
+          "type": "uint256"
+        }
+      ],
+      "name": "fundDepositAndReserve",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_addr",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_depositAmount",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_reserveAmount",
+          "type": "uint256"
+        }
+      ],
+      "name": "fundDepositAndReserveFor",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_sender",
+          "type": "address"
+        }
+      ],
+      "name": "getSenderInfo",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "uint256",
+              "name": "deposit",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "withdrawRound",
+              "type": "uint256"
+            }
+          ],
+          "internalType": "structMixinTicketBrokerCore.Sender",
+          "name": "sender",
+          "type": "tuple"
+        },
+        {
+          "components": [
+            {
+              "internalType": "uint256",
+              "name": "fundsRemaining",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "claimedInCurrentRound",
+              "type": "uint256"
+            }
+          ],
+          "internalType": "structMReserve.ReserveInfo",
+          "name": "reserve",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "components": [
+            {
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "faceValue",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "winProb",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "senderNonce",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "recipientRandHash",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes",
+              "name": "auxData",
+              "type": "bytes"
+            }
+          ],
+          "internalType": "structMTicketBrokerCore.Ticket",
+          "name": "_ticket",
+          "type": "tuple"
+        },
+        {
+          "internalType": "bytes",
+          "name": "_sig",
+          "type": "bytes"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_recipientRand",
+          "type": "uint256"
+        }
+      ],
+      "name": "redeemWinningTicket",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "unlock",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "withdraw",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "aggregator": [
+    {
+      "type": "function",
+      "name": "latestRoundData",
+      "stateMutability": "view",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "roundId",
+          "type": "uint80"
+        },
+        {
+          "name": "answer",
+          "type": "int256"
+        },
+        {
+          "name": "startedAt",
+          "type": "uint256"
+        },
+        {
+          "name": "updatedAt",
+          "type": "uint256"
+        },
+        {
+          "name": "answeredInRound",
+          "type": "uint80"
+        }
+      ]
+    }
+  ]
+}
