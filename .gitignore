@@ -3,3 +3,11 @@ test.local.env
 go.work
 go.work.sum
 __pycache__/
+.env
+.env.*
+test.*.local.env
+container.env
+.e2e-settings.env
+.e2e-source.json
+.DS_Store
+._*

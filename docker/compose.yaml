@@ -39,6 +39,8 @@ services:
     <<: *component
   runner:
     <<: *component
+  kafka-proxy:
+    <<: *component
   bridge:
     <<: *component
   tunnel:

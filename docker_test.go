@@ -173,6 +173,8 @@ func componentService(name, bin string, args []string) string {
 		return "tunnel"
 	case strings.Contains(name, "runner-fixture"):
 		return "runner"
+	case strings.Contains(bin, "e2e-kafka-proxy"):
+		return "kafka-proxy"
 	case strings.Contains(bin, "e2e-bridge"):
 		return "bridge"
 	case strings.Contains(bin, "e2e-runner") || bin == "uv":

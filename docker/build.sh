@@ -14,6 +14,7 @@ if [[ -n ${E2E_GOLANG_RUNNER_DIR:-} ]]; then
 fi
 go build -o "$E2E_RUN_ROOT/bin/e2e-runner" ./cmd/e2e-runner
 go build -o "$E2E_RUN_ROOT/bin/e2e-bridge" ./cmd/e2e-bridge
+go build -o "$E2E_RUN_ROOT/bin/e2e-kafka-proxy" ./cmd/e2e-kafka-proxy
 go test -c -o "$E2E_RUN_ROOT/bin/scope.test" .
 cd "$PYTHON_RUNNER_DIR"
 uv sync --frozen --extra examples

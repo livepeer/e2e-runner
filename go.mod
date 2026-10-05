@@ -6,6 +6,7 @@ require (
 	github.com/BurntSushi/toml v1.5.0
 	github.com/ethereum/go-ethereum v1.17.5
 	github.com/google/uuid v1.6.0
+	github.com/j0sh/minikafka v0.0.0-20260926062644-e1e6f1f8aae9
 	github.com/joho/godotenv v1.5.1
 	github.com/livepeer/golang-runner v0.0.0-20260724052422-c3be5a14a91f
 	github.com/segmentio/kafka-go v0.4.47
@@ -34,7 +35,6 @@ require (
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/gorilla/websocket v1.4.2 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
-	github.com/j0sh/minikafka v0.0.0-20260926062644-e1e6f1f8aae9 // indirect
 	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect

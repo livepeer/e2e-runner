@@ -22,12 +22,8 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 					c.requireFinality(t)
 				}
 				faults := faultRPC(t, c)
-				accounting := signer == "node"
-				ch := startClearinghouse(t, c, accounting)
-				var kafkaConfig map[string]any
-				if accounting {
-					kafkaConfig = ch.kafkaConfig(t)
-				}
+				ch := startClearinghouse(t, c, true)
+				kafkaConfig := ch.signerKafkaConfig(t, signer)
 				if scenario == "escrow and withdrawal" {
 					t.Setenv("E2E_PAYER_DEPOSIT_ETH", "0.0000008")
 				}
@@ -106,7 +102,7 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 					assertEscrowReconciled(t, ch, f)
 					return
 				}
-				if scenario == "delayed attribution" && accounting {
+				if scenario == "delayed attribution" {
 					ch.config["EnableAccounting"] = false
 					ch.restart(t)
 				}
@@ -147,18 +143,18 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 					return
 				}
 				expected := "matched"
-				if !accounting || scenario == "unmatched settlement" || scenario == "delayed attribution" {
+				if scenario == "unmatched settlement" || scenario == "delayed attribution" {
 					expected = "unmatched"
 				}
 				require.Positive(t, scalarInt(t, ch, "SELECT count(*) FROM settlements WHERE match_status=?", expected))
-				if scenario == "delayed attribution" && accounting {
+				if scenario == "delayed attribution" {
 					ch.config["EnableAccounting"] = true
 					ch.restart(t)
 					eventually(t, func() bool {
 						return scalarInt(t, ch, "SELECT count(*) FROM settlements WHERE match_status='matched'") > 0
 					}, envDuration(t, "E2E_ACCOUNTING_TIMEOUT", "20s"), 100*time.Millisecond)
 				}
-				if scenario == "ambiguous attribution fixture" && accounting {
+				if scenario == "ambiguous attribution fixture" {
 					// Explicit injected fixture: two authorized session IDs claim the same PM
 					// session. The successful matched path above used only real signer events.
 					raw := ch.latestEvent(t)

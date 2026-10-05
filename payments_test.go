@@ -84,7 +84,9 @@ func startSigner(t *testing.T, opts signerOptions) *testSigner {
 		if opts.webhook != "" {
 			args = append(args, "-remoteSignerWebhookUrl", opts.webhook, "-remoteSignerWebhookHeaders", opts.webhookHeaders)
 		}
-		// Kafka deliberately stays disabled for go-livepeer.
+		if opts.kafka != nil {
+			args = append(args, "-monitor=true", "-kafkaBootstrapServers", strings.TrimPrefix(opts.kafka["Broker"].(string), "kafka://"), "-kafkaGatewayTopic", opts.kafka["Topic"].(string))
+		}
 	}
 	opts.dir = dir
 	s := &testSigner{backend: opts.backend, base: base, metricsBase: publicURL(t, "http://"+metricsAddr), account: opts.account, opts: opts}

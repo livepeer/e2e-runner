@@ -164,25 +164,27 @@ Invalid/stale observation cases restart with a fresh valid observation before ea
 
 ## Clearinghouse Batteries cases
 
-The all-in-one `clearinghouse serve` fixture starts isolated SQLite storage, management API, signing-authorization webhook, and an on-chain listener configured with **TicketBroker resolved from the Controller and passed explicitly**. Node-signer fixtures additionally enable authenticated loopback Kafka and accounting. go-livepeer fixtures always keep Kafka disabled.
+The all-in-one `clearinghouse serve` fixture starts isolated SQLite storage, management API, signing-authorization webhook, and an on-chain listener configured with **TicketBroker resolved from the Controller and passed explicitly**. Both signer fixtures enable authenticated loopback Kafka and accounting. go-livepeer connects anonymously to the harness's minikafka-derived `e2e-kafka-proxy`, which forwards original record keys, payloads, timestamps and headers to Clearinghouse using its SCRAM producer credentials. The proxy acknowledges Produce only after upstream acceptance and restricts forwarding to the configured single-partition topic. In Compose mode it runs in the `kafka-proxy` service and uses the existing Kafka transport bridges.
 
 | Group | Purpose and assertions |
 |---|---|
 | Budgets/keys | ETH/USD grant and allocation creation/funding, API keys, exact balances, revocation refunds, allocation isolation, usage and ledger reporting. |
 | Service permissions | Missing/wrong tokens, wrong roles, insufficient management permissions, authorized operations. |
 | Signing authorization, both signers | Valid/malformed/revoked keys, paused/inactive grants or allocations, revoked allocations/sessions, validity windows, zero funding and binding changes. |
-| Actual Node usage | Real signer events from jobs against each orchestrator; ETH/USD fixed/live charging, recipient/session identity, ticket count/job type, exact allocation balances and ledger entries. |
+| Actual signer usage, both signers | Real signer events from jobs against each orchestrator; ETH/USD fixed/live charging, recipient/session identity, ticket count/job type, exact allocation balances and ledger entries. |
 | Exhaustion/funding | Applied charges exhaust an allocation; later signing fails; additional funding restores eligibility; delayed/concurrent issuance permits recorded overdraw. |
 | Injected event validation | Identical replay without another charge; conflicting event IDs; malformed envelopes; invalid fees/counts/times; missing USD amounts; unknown sessions and recipient/app/type mismatches. Unknown event types are explicitly ignored. These injected fixtures are labeled separately from successful real-event integrations. |
-| Persistence/outages | Broker interruption, pending signer outbox, signer restart/drain, clearinghouse restart, duplicate delivery, capacity failure withholding payment and unusable outbox storage failing startup. |
+| Persistence/outages, Node outbox | Broker interruption, pending signer outbox, signer restart/drain, clearinghouse restart, duplicate delivery, capacity failure withholding payment and unusable outbox storage failing startup. |
 | Revocation/late usage | Return unused allocation funds while recording actual previously issued usage delivered after revocation. |
 | Escrow, both signers | Deposit/reserve funding, claims, winning-ticket settlement, unlock/withdrawal and reconciliation with chain balances. |
-| Attribution | Node usage matches settlement without another grant charge; delayed, unmatched and ambiguous attribution. Ambiguous attribution uses an explicitly injected event. go-livepeer settlements remain unmatched because signing events are disabled. |
+| Attribution | Both signers' usage matches settlement without another grant charge; delayed, unmatched and ambiguous attribution. Ambiguous attribution uses an explicitly injected event. |
 | Listener recovery | Confirmations, persisted checkpoints, repeated logs, RPC outage, reorg rollback/replay and failure beyond retained reorg history. |
 
-`TestClearinghouseManagement` needs no chain. `TestClearinghouseSigning` tests all four pairings and continues Node usage coverage even when listener infrastructure is incompatible. `TestClearinghouseChainRecovery` exercises escrow, settlement attribution and listener recovery on a compatible controlled chain.
+`TestClearinghouseManagement` needs no chain. `TestClearinghouseSigning` tests all four pairings and continues both signers' usage coverage even when listener infrastructure is incompatible. `TestClearinghouseChainRecovery` exercises escrow, settlement attribution and listener recovery on a compatible controlled chain.
 
-**go-livepeer usage charging, usage-based exhaustion and usage-to-settlement attribution are deliberately untested while its Kafka is disabled.** There is no injected replacement presented as successful go-livepeer accounting.
+go-livepeer usage charging, usage-based exhaustion and usage-to-settlement attribution use real signer events. Its in-memory producer queue has no durable outbox, so storage, capacity and restart/drain assertions remain Node-specific. Late-usage cases pause accounting ingestion while retaining the broker. `TestClearinghouseKafkaProxy` provides a chain-free proxy smoke test in normal and Compose modes, using a labeled injected event whose original payload must reach Clearinghouse unchanged. The minikafka dependency requires Go 1.27.1 or newer.
+
+GCP Compose validation on 2026-10-04 passed the anonymous proxy smoke test and real go-livepeer exhaustion, late-revocation and concurrent-liability cases. ETH/USD fixed/hour cases passed event identity and exact charging assertions, then failed at `GET /v1/usage`: Clearinghouse returned HTTP 500 and logged `computed_fee_eth: invalid amount units`. This reporting failure remains an asserted failure; the run did not validate settlement attribution. The default devnet also continued reporting its known canonical-header incompatibility to the on-chain listener.
 
 ## Run artifacts
 

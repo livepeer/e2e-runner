@@ -278,11 +278,8 @@ func TestClearinghouseSigning(t *testing.T) {
 	forEachPair(t, func(t *testing.T, orchBackend, signerBackend string) {
 		fixturePoolFor(t)
 		c := preflightChain(t)
-		ch := startClearinghouse(t, c, signerBackend == "node")
-		var kafkaConfig map[string]any
-		if signerBackend == "node" {
-			kafkaConfig = ch.kafkaConfig(t)
-		}
+		ch := startClearinghouse(t, c, true)
+		kafkaConfig := ch.signerKafkaConfig(t, signerBackend)
 		f := setupPaid(t, c, orchBackend, signerBackend, ch.webhook+"/v1/signer/authorize", "Livepeer-Clearinghouse-Token: "+ch.signerSecret, kafkaConfig)
 		ch.enableListener(t, f.payer.address.Hex())
 		runClearinghouseAuthorization(t, ch, f)
@@ -317,19 +314,12 @@ func TestClearinghouseSigning(t *testing.T) {
 			}, envDuration(t, "E2E_ACCOUNTING_TIMEOUT", "20s"), 200*time.Millisecond)
 			ch.request(t, "GET", "/v1/escrow/report", nil, 200, nil)
 		})
-		if signerBackend == "node" {
-			runNodeAccounting(t, ch, f)
-			runLateAccounting(t, ch, f)
-		} else {
-			t.Run("Kafka disabled", func(t *testing.T) {
-				require.Equal(t, 0, ch.usageCount(t, "applied"))
-				require.Nil(t, f.signer.opts.kafka)
-			})
-		}
+		runSignerAccounting(t, ch, f)
+		runLateAccounting(t, ch, f)
 	})
 }
 
-func runNodeAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
+func runSignerAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 	var rawFixture []byte
 	for _, currency := range []string{"eth", "usd"} {
 		for _, unit := range []string{"fixed", "hour"} {
@@ -457,6 +447,9 @@ func runNodeAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 		ch.request(t, "POST", "/v1/allocations/"+k.Allocation+"/fund", map[string]string{"amount_eth": "0.01"}, 200, nil)
 		j.sign(t, k.headers())
 	})
+	if f.signer.backend != "node" {
+		return
+	}
 	t.Run("broker outage signer restart and replay", func(t *testing.T) {
 		k := ch.key(t, "eth", "1")
 		j := f.job(t, "fixed", "persistent")

@@ -143,6 +143,9 @@ func runLateAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 		require.Equal(t, total.String(), ch.balance(t, k, "allocation_spent").String())
 		require.Equal(t, new(big.Int).Sub(big.NewInt(1), total).String(), ch.balance(t, k, "allocation_available").String())
 	})
+	if f.signer.backend != "node" {
+		return
+	}
 	t.Run("outbox storage failure", func(t *testing.T) {
 		opts := f.signer.opts
 		opts.kafka = cloneMap(opts.kafka)
@@ -163,12 +166,12 @@ func runLateAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 
 func pauseAccounting(t *testing.T, ch *clearinghouseFixture) func() {
 	t.Helper()
-	ch.config["EnableKafka"], ch.config["EnableAccounting"] = false, false
+	ch.config["EnableAccounting"] = false
 	ch.restart(t)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			ch.config["EnableKafka"], ch.config["EnableAccounting"] = true, true
+			ch.config["EnableAccounting"] = true
 			ch.restart(t)
 		})
 	}
@@ -176,7 +179,9 @@ func pauseAccounting(t *testing.T, ch *clearinghouseFixture) func() {
 
 func runFullOutbox(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 	t.Run("full outbox and recovery", func(t *testing.T) {
-		restore := pauseAccounting(t, ch)
+		ch.config["EnableKafka"] = false
+		restoreAccounting := pauseAccounting(t, ch)
+		restore := func() { ch.config["EnableKafka"] = true; restoreAccounting() }
 		defer restore()
 		opts := f.signer.opts
 		opts.kafka = cloneMap(opts.kafka)
