@@ -12,7 +12,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -242,7 +241,7 @@ type pythonRunner struct {
 
 type goRunnerRegistration struct {
 	ctx context.Context
-	reg *liverunner.Runner
+	reg runnerSDK
 }
 
 func runnerImplementations() []runnerImplementation {
@@ -273,7 +272,7 @@ func (goRunnerImplementation) Start(t *testing.T, ctx context.Context, orch *tes
 }
 
 func (goRunnerImplementation) StartSessionControlRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cfg runnerConfig) runnerRegistration {
-	var reg *liverunner.Runner
+	var reg runnerSDK
 	var upstream *httptest.Server
 	upstream = newFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if reg == nil {
@@ -505,6 +504,13 @@ func requireDomainProxyURL(t *testing.T, orch *testOrchestrator, rawURL, route s
 	require.NoError(t, err)
 	serviceURL, err := url.Parse(orch.httpBase)
 	require.NoError(t, err)
+	if composeMode() {
+		require.Equal(t, "https", u.Scheme)
+		require.Equal(t, serviceURL.Host, u.Host)
+		require.True(t, strings.HasPrefix(u.Path, "/e2e-proxy/"), rawURL)
+		require.NotEmpty(t, strings.TrimPrefix(u.Path, "/e2e-proxy/"))
+		return
+	}
 	require.Equal(t, "http", u.Scheme)
 	require.Equal(t, serviceURL.Port(), u.Port())
 	require.True(t, strings.HasSuffix(u.Hostname(), ".localhost"), rawURL)
@@ -880,13 +886,10 @@ func runMediaRoundTrip(t *testing.T, orch *testOrchestrator, signer *testSigner)
 
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_MEDIA_TIMEOUT", "40s"))
 	defer cancel()
-	cmd := exec.CommandContext(
-		ctx,
-		"uv", "run", "--frozen", "--extra", "examples", "python", "-u", "-c",
+	cmd := fixtureCommand(t, ctx, "python-media", "uv", pythonRunnerDir, "run", "--frozen", "--extra", "examples", "python", "-u", "-c",
 		pythonMultiTrackMediaRoundTripScript,
 		publishURL,
 	)
-	cmd.Dir = pythonRunnerDir
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -950,8 +953,12 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 	t.Helper()
 	runCtx, cancel := context.WithCancel(ctx)
 	pythonRunnerDir := repoDir(t, envPythonRunnerDir)
-	cmd := exec.CommandContext(runCtx,
-		"uv", "run", "--frozen", "python", "-u", "-c", script,
+	port := fixturePort(t)
+	runnerURL := ""
+	if composeMode() && script == pythonRunnerSessionControlsScript {
+		runnerURL = publicURL(t, "http://127.0.0.1:"+port)
+	}
+	cmd := fixtureCommand(t, runCtx, "python-runner", "uv", pythonRunnerDir, "run", "--frozen", "python", "-u", "-c", script,
 		orch.httpBase,
 		liveRunnerSecret,
 		cfg.runnerURL,
@@ -961,9 +968,8 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 		fmt.Sprintf("%d", cfg.capacity),
 		cfg.metadata,
 		fmt.Sprintf("%t", cfg.proxy),
-		string(runnerPrice(cfg).Price), runnerPrice(cfg).Unit, fixturePort(t),
+		string(runnerPrice(cfg).Price), runnerPrice(cfg).Unit, port, runnerURL,
 	)
-	cmd.Dir = pythonRunnerDir
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
 	stdout, err := cmd.StdoutPipe()
@@ -1025,6 +1031,9 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 
 func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cfg runnerConfig) *goRunnerRegistration {
 	t.Helper()
+	if composeMode() {
+		return startContainerGoRunner(t, ctx, orch, cfg)
+	}
 	require.NotEmpty(t, cfg.runnerURL)
 	price, err := liverunner.NewPriceInfo(string(runnerPrice(cfg).Price), "USD", runnerPrice(cfg).Unit)
 	require.NoError(t, err)
@@ -1057,8 +1066,7 @@ func runPythonRunnerMissingPrice(t *testing.T, orch *testOrchestrator, secret, r
 	pythonRunnerDir := repoDir(t, envPythonRunnerDir)
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_JOB_TIMEOUT", "30s"))
 	defer cancel()
-	cmd := exec.CommandContext(ctx,
-		"uv", "run", "--frozen", "python", "-u", "-c", pythonRunnerMissingPriceScript,
+	cmd := fixtureCommand(t, ctx, "python-negative", "uv", pythonRunnerDir, "run", "--frozen", "python", "-u", "-c", pythonRunnerMissingPriceScript,
 		orch.httpBase,
 		secret,
 		runnerURL,
@@ -1066,7 +1074,6 @@ func runPythonRunnerMissingPrice(t *testing.T, orch *testOrchestrator, secret, r
 		mode,
 		label,
 	)
-	cmd.Dir = pythonRunnerDir
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		t.Fatalf("timed out waiting for python-runner missing-price check: %s", string(output))

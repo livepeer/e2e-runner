@@ -82,7 +82,7 @@ async def main():
     await site.start()
     sockets = site._server.sockets
     port = sockets[0].getsockname()[1]
-    runner_url = f"http://127.0.0.1:{port}"
+    runner_url = sys.argv[13] if len(sys.argv) > 13 and sys.argv[13] else f"http://127.0.0.1:{port}"
 
     try:
         reg = await register_runner(

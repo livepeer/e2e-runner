@@ -44,6 +44,11 @@ func startClearinghouse(t *testing.T, c *chainFixture, accounting bool) *clearin
 	creds := filepath.Join(dir, "credentials.json")
 	require.NoError(t, os.WriteFile(creds, data, 0600))
 	ch.config = map[string]any{"DBPath": ch.db, "CredsFile": creds, "EnableAuthWebhook": strings.TrimPrefix(ch.webhook, "http://"), "EnableManagementAPI": strings.TrimPrefix(ch.management, "http://"), "EnableKafka": accounting, "EnableAccounting": accounting, "KafkaBind": ch.broker, "KafkaTopic": ch.topic}
+	ch.management = publicURL(t, ch.management)
+	ch.webhook = publicURL(t, ch.webhook)
+	if composeMode() && accounting {
+		ch.broker = tunneledKafka(t, ch.broker)
+	}
 	ch.restart(t)
 	return ch
 }

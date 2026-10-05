@@ -12,7 +12,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -89,8 +88,7 @@ func nodeAccountCreate(t *testing.T, dir string, a *chainAccount) ([]byte, error
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_CLI_TIMEOUT", "2m"))
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary(t, "node"), "chain", "account", "create", "--config", secretFile(t, dir, "create.toml", ""), "--keystore-file", a.keystore, "--keystore-password-file", a.passwordFile, "--output", "json")
-	cmd.Dir = dir
+	cmd := fixtureCommand(t, ctx, "node-chain", binary(t, "node"), dir, "chain", "account", "create", "--config", secretFile(t, dir, "create.toml", ""), "--keystore-file", a.keystore, "--keystore-password-file", a.passwordFile, "--output", "json")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
@@ -115,7 +113,7 @@ func (c *chainFixture) nodeCLI(t *testing.T, a *chainAccount, submit bool, comma
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_CLI_TIMEOUT", "2m"))
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := fixtureCommand(t, ctx, "node-chain", bin, dir, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
@@ -193,7 +191,7 @@ func (c *chainFixture) goControl(t *testing.T, a *chainAccount, addresses ...str
 	args := []string{"-gateway", "-enableCliTxRoutes", "-httpAddr", addresses[1], "-cliAddr", cliAddr, "-rtmpAddr", addresses[2], "-datadir", dir, "-maxPricePerUnit", "1", "-orchAddr", "http://127.0.0.1:1"}
 	args = append(args, chainFlags(c, a)...)
 	p := startChild(t, "go-chain-control", binary(t, "go-livepeer"), dir, args)
-	control := &goChainControl{base: "http://" + cliAddr, process: p}
+	control := &goChainControl{base: publicURL(t, "http://"+cliAddr), process: p}
 	waitForHTTP(t, "GET", control.base+"/status", 200, p.logPath)
 	c.goControls[a.address] = control
 	return control
@@ -230,7 +228,7 @@ func (c *chainFixture) goCLI(t *testing.T, a *chainAccount, choice string, input
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_CLI_TIMEOUT", "2m"))
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary(t, "go-livepeer-cli"), "-host", host, "-http", port)
+	cmd := fixtureCommand(t, ctx, "go-livepeer-cli", binary(t, "go-livepeer-cli"), "", "-host", host, "-http", port)
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
 	var output lockedBuffer

@@ -1,0 +1,54 @@
+x-component: &component
+  image: ${E2E_RUNTIME_IMAGE:-e2e-scope-runtime:local}
+  # Linux loopback origins stay private. Advertised URLs use Quick Tunnels.
+  network_mode: host
+  working_dir: ${E2E_RUN_ROOT}/scope
+  volumes:
+    - ${E2E_RUN_ROOT}:${E2E_RUN_ROOT}
+    - go-modules:/go/pkg/mod
+    - go-build:/root/.cache/go-build
+  env_file: ${E2E_RUN_ROOT}/container.env
+  init: true
+services:
+  geth:
+    image: ${E2E_GETH_IMAGE:-livepeer/geth-with-livepeer-protocol:confluence}
+    ports:
+      - "127.0.0.1:${E2E_GETH_PORT:-0}:8545"
+  harness:
+    <<: *component
+    volumes:
+      - ${E2E_RUN_ROOT}:${E2E_RUN_ROOT}
+      - /var/run/docker.sock:/var/run/docker.sock
+      - go-modules:/go/pkg/mod
+      - go-build:/root/.cache/go-build
+  builder:
+    <<: *component
+  node-signer:
+    <<: *component
+  node-orchestrator:
+    <<: *component
+  node-chain:
+    <<: *component
+  go-livepeer-signer:
+    <<: *component
+  go-livepeer-orchestrator:
+    <<: *component
+  go-livepeer-control:
+    <<: *component
+  clearinghouse:
+    <<: *component
+  runner:
+    <<: *component
+  bridge:
+    <<: *component
+  tunnel:
+    image: ${E2E_CLOUDFLARED_IMAGE:-cloudflare/cloudflared:2026.9.1}
+    network_mode: host
+    command: ["tunnel", "--no-autoupdate", "--protocol", "http2", "--url", "http://127.0.0.1:8545"]
+volumes:
+  go-modules:
+    name: e2e-scope-go-modules
+    external: true
+  go-build:
+    name: e2e-scope-go-build
+    external: true

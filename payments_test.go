@@ -10,7 +10,6 @@ import (
 	"io"
 	"math/big"
 	"net/http"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -54,7 +53,7 @@ func startSigner(t *testing.T, opts signerOptions) *testSigner {
 		dir = t.TempDir()
 	}
 	addr := freeAddr(t)
-	base := "http://" + addr
+	base := publicURL(t, "http://"+addr)
 	metricsAddr := freeAddr(t)
 	var args []string
 	if opts.backend == "node" {
@@ -88,7 +87,7 @@ func startSigner(t *testing.T, opts signerOptions) *testSigner {
 		// Kafka deliberately stays disabled for go-livepeer.
 	}
 	opts.dir = dir
-	s := &testSigner{backend: opts.backend, base: base, metricsBase: "http://" + metricsAddr, account: opts.account, opts: opts}
+	s := &testSigner{backend: opts.backend, base: base, metricsBase: publicURL(t, "http://"+metricsAddr), account: opts.account, opts: opts}
 	s.process = startChild(t, "signer-"+opts.backend, binary(t, opts.backend), dir, args)
 	s.logPath = s.process.logPath
 	waitForHTTP(t, http.MethodPost, s.base+"/sign-orchestrator-info", 200, s.logPath)
@@ -504,8 +503,7 @@ func runPythonPaidJob(t *testing.T, signer *testSigner, runner discoveryRunner, 
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_JOB_TIMEOUT", "30s"))
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "uv", "run", "--frozen", "python", "-u", "-c", pythonPaidJob)
-	cmd.Dir = repoDir(t, envPythonRunnerDir)
+	cmd := fixtureCommand(t, ctx, "python-paid-job", "uv", repoDir(t, envPythonRunnerDir), "run", "--frozen", "python", "-u", "-c", pythonPaidJob)
 	cmd.Stdin = bytes.NewReader(input)
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "Python SDK paid job: %s\n%s\n%s", output, readLog(t, orch.logPath), readLog(t, signer.logPath))

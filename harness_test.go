@@ -56,7 +56,18 @@ func TestMain(m *testing.M) {
 	if errBuild != nil {
 		panic(errBuild)
 	}
+	stopCompose, err := initializeCompose()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "INFRASTRUCTURE: fresh Compose devnet:", err)
+		_ = os.RemoveAll(buildRoot)
+		os.Exit(1)
+	}
 	code := m.Run()
+	stopPooledTunnels()
+	stopCompose()
+	if composeCleanupFailed.Load() && code == 0 {
+		code = 1
+	}
 	_ = os.RemoveAll(buildRoot)
 	os.Exit(code)
 }
@@ -177,10 +188,11 @@ func repoDir(t *testing.T, key string) string {
 }
 
 type childProcess struct {
-	cmd      *exec.Cmd
-	done     chan error
-	logPath  string
-	stopOnce sync.Once
+	cmd         *exec.Cmd
+	done        chan error
+	logPath     string
+	stopOnce    sync.Once
+	containerID string
 }
 
 func startChild(t *testing.T, name, bin, dir string, args []string, extraEnv ...string) *childProcess {
@@ -192,12 +204,10 @@ func startChild(t *testing.T, name, bin, dir string, args []string, extraEnv ...
 	digest := sha256.Sum256([]byte(t.Name() + name + fmt.Sprint(time.Now().UnixNano())))
 	logFile, err := os.Create(filepath.Join(absolute, fmt.Sprintf("%s-%x.log", name, digest[:6])))
 	require.NoError(t, err)
-	cmd := exec.Command(bin, args...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd, containerID := componentCommand(context.Background(), name, bin, dir, args, extraEnv...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	p := &childProcess{cmd: cmd, done: make(chan error, 1), logPath: logFile.Name()}
+	p := &childProcess{cmd: cmd, done: make(chan error, 1), logPath: logFile.Name(), containerID: containerID}
 	require.NoError(t, cmd.Start())
 	go func() { p.done <- cmd.Wait(); _ = logFile.Close(); close(p.done) }()
 	t.Cleanup(func() { p.stop() })
@@ -205,12 +215,20 @@ func startChild(t *testing.T, name, bin, dir string, args []string, extraEnv ...
 }
 func (p *childProcess) stop() {
 	p.stopOnce.Do(func() {
+		if p.containerID != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = exec.CommandContext(ctx, "docker", "stop", "-t", "3", p.containerID).Run()
+			cancel()
+		}
 		_ = p.cmd.Process.Signal(os.Interrupt)
 		select {
 		case <-p.done:
 		case <-time.After(3 * time.Second):
 			_ = p.cmd.Process.Kill()
 			<-p.done
+		}
+		if p.containerID != "" {
+			removeContainer(p.containerID)
 		}
 	})
 }
@@ -261,14 +279,19 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 		backend = backendFor(t)
 	}
 	httpAddr, cliAddr := freeAddr(t), freeAddr(t)
-	base := "http://" + httpAddr
+	base := publicURL(t, "http://"+httpAddr)
 	template := opts.proxyURLTemplate
+	if composeMode() && template != "" {
+		// Quick Tunnels allocate one public hostname, so exercise the same
+		// template routing with a final path placeholder instead of wildcard DNS.
+		template = base + "/e2e-proxy/{proxy}"
+	}
 	if template != "" {
 		_, port, err := net.SplitHostPort(httpAddr)
 		require.NoError(t, err)
 		template = strings.ReplaceAll(template, "{http_port}", port)
 	}
-	orch := &testOrchestrator{backend: backend, httpBase: base, cliBase: "http://" + cliAddr, proxyURLTemplate: template}
+	orch := &testOrchestrator{backend: backend, httpBase: base, cliBase: publicURL(t, "http://"+cliAddr), proxyURLTemplate: template}
 	var args []string
 	var dir string
 	stateDir := opts.dir
@@ -303,9 +326,10 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 			config["RedeemerDB"] = filepath.Join(dir, "redeemer.sqlite")
 			config["KeystoreFile"] = opts.account.keystore
 			config["KeystorePasswordFile"] = opts.account.passwordFile
-			config["PaymentRPCURLFile"] = secretFile(t, dir, "rpc", opts.chain.url)
-			config["PaymentChainID"] = opts.chain.chainID.Uint64()
-			config["PaymentController"] = opts.chain.controller.Hex()
+			config["Network"] = "devenv"
+			config["RPCURLFile"] = secretFile(t, dir, "rpc", opts.chain.url)
+			config["ChainID"] = opts.chain.chainID.Uint64()
+			config["Controller"] = opts.chain.controller.Hex()
 			config["WeiPerUSD"] = envDefault("E2E_WEI_PER_USD", "1000000000000000")
 			if opts.useOracle {
 				delete(config, "WeiPerUSD")
@@ -321,7 +345,7 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 		args = []string{"orchestrator", "--config", writeTOML(t, filepath.Join(dir, "orchestrator.toml"), config)}
 	} else {
 		dir = stateDir
-		args = []string{"-orchestrator", "-useLiveRunners", "-orchSecret", liveRunnerSecret, "-serviceAddr", base, "-httpAddr", base, "-cliAddr", cliAddr, "-rtmpAddr", freeAddr(t), "-datadir", filepath.Join(opts.dir, "data"), "-startupAvailabilityCheck=false"}
+		args = []string{"-orchestrator", "-useLiveRunners", "-orchSecret", liveRunnerSecret, "-serviceAddr", base, "-httpAddr", "http://" + httpAddr, "-cliAddr", cliAddr, "-rtmpAddr", freeAddr(t), "-datadir", filepath.Join(opts.dir, "data"), "-startupAvailabilityCheck=false"}
 		if opts.account == nil {
 			args = append(args, "-network", "offchain")
 		} else {
@@ -431,6 +455,12 @@ func newFixtureServer(t *testing.T, h http.Handler) *httptest.Server {
 	srv.Listener = ln
 	srv.Start()
 	t.Cleanup(srv.Close)
+	if composeMode() {
+		controlURL := publicControlURL(t, srv.URL)
+		addr := freeAddr(t)
+		startChild(t, "runner-fixture", filepath.Join(os.Getenv("E2E_RUN_ROOT"), "bin/e2e-bridge"), "", []string{"-mode", "proxy", "-listen", addr, "-target", controlURL})
+		srv.URL = publicURL(t, "http://"+addr)
+	}
 	return srv
 }
 

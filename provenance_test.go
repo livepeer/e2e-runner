@@ -51,6 +51,16 @@ func recordBinary(t *testing.T, name, path string) {
 			return exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
 		}
 		entry := map[string]string{"directory": dir}
+		if composeMode() {
+			data, err := os.ReadFile(filepath.Join(dir, ".e2e-source.json"))
+			require.NoError(t, err)
+			var source map[string]string
+			require.NoError(t, json.Unmarshal(data, &source))
+			entry["revision"], entry["local_changes"], entry["original_directory"] = source["revision"], source["status"], source["source"]
+			entry["snapshot_sha256"] = source["snapshot_sha256"]
+			provenance.Sources[name] = entry
+			continue
+		}
 		for key, args := range map[string][]string{"revision": {"rev-parse", "HEAD"}, "local_changes": {"status", "--short"}} {
 			output, err := git(args...)
 			if err == nil {

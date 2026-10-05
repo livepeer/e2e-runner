@@ -33,6 +33,18 @@ func run() error {
 	if len(args) == 0 {
 		args = []string{"test", "-count=1", "./..."}
 	}
+	if args[0] == "compose" || args[0] == "compose-gcp" {
+		if len(args) == 1 {
+			args = append(args, strings.Fields(os.Getenv("E2E_COMPOSE_TEST_ARGS"))...)
+		}
+		script := "docker/run.sh"
+		if args[0] == "compose-gcp" {
+			script = "docker/validate-gcp.sh"
+		}
+		command := exec.Command("bash", append([]string{script}, args[1:]...)...)
+		command.Stdout, command.Stderr, command.Stdin = os.Stdout, os.Stderr, os.Stdin
+		return command.Run()
+	}
 	if args[0] == "test" {
 		hasTimeout := slices.ContainsFunc(args[1:], func(arg string) bool {
 			return arg == "-timeout" || strings.HasPrefix(arg, "-timeout=")
