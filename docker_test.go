@@ -4,14 +4,19 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -246,6 +251,62 @@ func removeContainer(id string) {
 
 var quickURL = regexp.MustCompile(`https://[a-z0-9-]+\.trycloudflare\.com`)
 
+type quickTunnelRateLimitError struct {
+	err       error
+	notBefore time.Time
+}
+
+func (e *quickTunnelRateLimitError) Error() string {
+	return fmt.Sprintf("Quick Tunnel provisioning returned HTTP 429: %v", e.err)
+}
+func (e *quickTunnelRateLimitError) Unwrap() error { return e.err }
+
+func retryAfterTime(value string, now time.Time) time.Time {
+	value = strings.TrimSpace(value)
+	if value != "" && strings.IndexFunc(value, func(r rune) bool { return r < '0' || r > '9' }) < 0 {
+		seconds, err := strconv.ParseUint(value, 10, 64)
+		const maxDelay time.Duration = 1<<63 - 1
+		// Saturate large values rather than overflowing into an early retry.
+		if err != nil || seconds > uint64(maxDelay/time.Second) {
+			return now.Add(maxDelay)
+		}
+		return now.Add(time.Duration(seconds) * time.Second)
+	}
+	deadline, _ := http.ParseTime(value)
+	return deadline
+}
+
+func quickTunnelRetryDelay(err error, attempt int, now time.Time) (time.Duration, bool) {
+	var limited *quickTunnelRateLimitError
+	if !errors.As(err, &limited) {
+		return 0, false
+	}
+	backoff := min(30*time.Second*time.Duration(1<<attempt), 2*time.Minute)
+	return max(backoff, limited.notBefore.Sub(now)), true
+}
+
+// cloudflared does not expose provisioning response headers in its errors.
+// Relay only that request over loopback, preserving HTTPS to the upstream API.
+func tunnelProvisioningProxy(target *url.URL, transport http.RoundTripper) (*httptest.Server, <-chan time.Time) {
+	limited := make(chan time.Time, 1)
+	proxy := &httputil.ReverseProxy{
+		Rewrite:   func(r *httputil.ProxyRequest) { r.SetURL(target) },
+		Transport: transport,
+		ModifyResponse: func(r *http.Response) error {
+			if r.StatusCode == http.StatusTooManyRequests {
+				select {
+				case limited <- retryAfterTime(r.Header.Get("Retry-After"), time.Now()):
+				default:
+				}
+			}
+			return nil
+		},
+	}
+	mux := http.NewServeMux()
+	mux.Handle("POST /tunnel", proxy)
+	return httptest.NewServer(mux), limited
+}
+
 func launchTunnel(origin, logPath string) (string, func(), error) {
 	var err error
 	for attempt := 0; attempt < 5; attempt++ {
@@ -254,10 +315,10 @@ func launchTunnel(origin, logPath string) (string, func(), error) {
 			return endpoint, stop, nil
 		}
 		err = failure
-		if !strings.Contains(err.Error(), "status 429") || attempt == 4 {
+		delay, retry := quickTunnelRetryDelay(err, attempt, time.Now())
+		if !retry || attempt == 4 {
 			return "", nil, err
 		}
-		delay := min(30*time.Second*time.Duration(1<<attempt), 2*time.Minute)
 		fmt.Fprintf(os.Stderr, "Quick Tunnel provisioning rate limited; retrying in %s (attempt %d/5)\n", delay, attempt+2)
 		time.Sleep(delay)
 	}
@@ -265,12 +326,22 @@ func launchTunnel(origin, logPath string) (string, func(), error) {
 }
 
 func launchTunnelOnce(origin, logPath string) (string, func(), error) {
+	service, limited := tunnelProvisioningProxy(&url.URL{Scheme: "https", Host: "api.trycloudflare.com"}, http.DefaultTransport)
+	defer service.Close()
+	failure := func(err error) (string, func(), error) {
+		select {
+		case notBefore := <-limited:
+			err = &quickTunnelRateLimitError{err: err, notBefore: notBefore}
+		default:
+		}
+		return "", nil, err
+	}
 	id := os.Getenv("COMPOSE_PROJECT_NAME") + "-tunnel-" + uuid.NewString()
 	log, err := os.Create(logPath)
 	if err != nil {
 		return "", nil, err
 	}
-	cmd := exec.Command("docker", composeArgs("tunnel", id, "", []string{"tunnel", "--no-autoupdate", "--protocol", "http2", "--url", origin})...)
+	cmd := exec.Command("docker", composeArgs("tunnel", id, "", []string{"tunnel", "--no-autoupdate", "--protocol", "http2", "--quick-service", service.URL, "--url", origin})...)
 	cmd.Stdout, cmd.Stderr = log, log
 	if err := cmd.Start(); err != nil {
 		log.Close()
@@ -302,13 +373,14 @@ func launchTunnelOnce(origin, logPath string) (string, func(), error) {
 		select {
 		case err := <-done:
 			removeContainer(id)
-			return "", nil, fmt.Errorf("tunnel exited: %v: %s", err, data)
+			data, _ = os.ReadFile(logPath)
+			return failure(fmt.Errorf("tunnel exited: %v: %s", err, data))
 		default:
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	stop()
-	return "", nil, fmt.Errorf("Quick Tunnel readiness timed out: %s", logPath)
+	return failure(fmt.Errorf("Quick Tunnel readiness timed out: %s", logPath))
 }
 
 func publicURL(t *testing.T, origin string) string {
