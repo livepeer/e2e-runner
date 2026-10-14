@@ -42,7 +42,7 @@ func runPaidLifecycle(t *testing.T, f *paidFixture) {
 				_, _ = w.Write([]byte(`{"paid":true,"prompt":"hello"}`))
 			}))
 			cfg := staticRunnerConfig{Runners: []staticRunnerConfigEntry{{Label: "paid-lifecycle", Routing: "label", RunnerURL: upstream.URL, HealthURL: upstream.URL + "/health", App: liveRunnerApp, Metadata: "paid-lifecycle", Mode: "persistent", Capacity: 2, Proxy: true, PriceInfo: priceInfo{Price: "3.6", Currency: "usd", Unit: "hour"}}}}
-			opts := orchestratorOptions{backend: f.orch.backend, chain: f.chain, account: f.recipient}
+			opts := f.orchestratorOptions()
 			if scenario != "unregister" && scenario != "cancellation" {
 				opts.staticConfigPath = writeStaticConfig(t, cfg)
 			}

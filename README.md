@@ -27,7 +27,7 @@ E2E_ORCHESTRATORS=node E2E_SIGNERS=node go test -count=1 -run '^TestOnchainPayme
 E2E_ENV_FILE=test.local.env make test-onchain
 ```
 
-Run chain-changing suites serially; do not launch payment and accounting runs concurrently against the same chain. Go's slash-separated `-run` expressions can select a pairing and a case. For example, `-run '^TestOnchainPayments/go-livepeer/go-livepeer/challenge_and_admission$'`.
+Run chain-changing suites serially; do not launch payment and accounting runs concurrently against the same chain. Go's slash-separated `-run` expressions can select a pairing, wallet mode, and case. For example, `-run '^TestOnchainPayments/go-livepeer/go-livepeer/split-wallet/challenge_and_admission$'`. Select the original wallet setup with `-run '^TestOnchainPayments/[^/]+/[^/]+/same-wallet$'`, or split wallets across all pairings with `-run '^TestOnchainPayments/[^/]+/[^/]+/split-wallet$'`.
 
 ## Docker Compose mode
 
@@ -126,7 +126,7 @@ Startup static fixtures translate to go-livepeer JSON or Node TOML. Runtime CLI 
 
 ## On-chain cases
 
-Payment coverage includes the four pairings below. Every job uses one signer implementation and key for its entire lifetime, including replica and restart scenarios. Attempts to use a different key exercise isolation checks.
+Payment, recovery, oracle, Clearinghouse signing, and Clearinghouse chain-recovery coverage run the four pairings below in both `same-wallet` and `split-wallet` modes. Every job uses one signer implementation and key for its entire lifetime, including replica and restart scenarios. Attempts to use a different key exercise isolation checks.
 
 | Orchestrator | Signer |
 |---|---|
@@ -135,11 +135,13 @@ Payment coverage includes the four pairings below. Every job uses one signer imp
 | Node | go-livepeer |
 | Node | Node |
 
-Successful jobs additionally cover Python/Go runner SDKs × persistent/single-shot × USD/hour or USD/fixed × proxy on/off: **64 combinations**. The Python payment client performs the successful payment flow. Direct protocol requests create malformed or conflicting inputs.
+In `same-wallet` mode, the registered orchestrator receives tickets and pays redemption gas using the same account, retaining the default recipient configuration. In `split-wallet` mode, the harness bonds and activates a cold recipient and funds a separate, inactive hot account with ETH for redemption gas. Only the hot keystore is loaded by orchestrator processes; Node receives the cold `OrchestratorAddress`, and go-livepeer receives `-ethOrchAddr`. The harness retains the cold key for setup. Secondary processes and restarts preserve these roles.
+
+Successful jobs additionally cover Python/Go runner SDKs × persistent/single-shot × USD/hour or USD/fixed × proxy on/off: **128 combinations** across both wallet modes. The Python payment client performs the successful payment flow. Direct protocol requests create malformed or conflicting inputs. Both modes run serially and roughly double paid-suite runtime; use the existing suite timeout controls as needed. CLI, infrastructure, off-chain, and Clearinghouse management-only cases run independently of wallet mode.
 
 | Group | Purpose and assertions |
 |---|---|
-| Identity and discovery | Recover the signer identity; check payment recipient, application/GPU filters, normalized wei prices, and capacity. Each backend's identity signature format is verified explicitly. |
+| Identity and discovery | Recover the signer identity; check challenge and signed-ticket recipients, application/GPU filters, normalized wei prices, and capacity. Node advertises the ticket recipient; go-livepeer advertises its service signing account, which is the hot address in split mode. Each backend's identity signature format is verified explicitly. |
 | Dynamic and static prices | Valid fixed/hourly startup and runtime registrations; reject missing, empty, zero, negative, malformed, unsupported-currency and unsupported-unit prices at initial registration, heartbeat update, startup and runtime CLI registration. Invalid updates must retain the current runner price. |
 | Zero-price/session regression | Paid sessions retain agreed prices after rejected missing/zero updates and valid repricing; new sessions use updated prices. |
 | Challenge/admission | Unpaid reservation returns parameters without forwarding work or consuming a slot; valid payment forwards the response and reserves capacity; stop releases it. |
@@ -152,7 +154,7 @@ Successful jobs additionally cover Python/Go runner SDKs × persistent/single-sh
 | Funding | Missing/insufficient deposit or claimable reserve, impending withdrawal, recovery after funding/cancel-unlock, and concurrent accounting liabilities. |
 | Authorization | Approve/reject; unavailable/malformed webhook; cached and per-request decisions; changed authorization identity; price limits; rejection returns no usable payment credentials. |
 | Media/lifecycle | Paid multitrack media and cleanup, stop/unregister, live exhaustion, channels/proxies, cancellation, failed health and shutdown. |
-| Redemption/recovery | Observe actual winning tickets using bounded generation; wait beyond acceptance expiry; check receipts and escrow debit; reject duplicate/invalid redemption; pending restart, RPC interruption, fee limits, delayed confirmation and reorg recovery. Node confirms through `finalized`; go-livepeer uses mined receipts. |
+| Redemption/recovery | Observe actual winning tickets using bounded generation; wait beyond acceptance expiry; check persisted recipient, transaction gas payer, TicketBroker event payer/recipient, and escrow debit; reject duplicate/invalid redemption using the hot account after stopping its worker; pending restart, RPC interruption, fee limits, delayed confirmation and reorg recovery. Node confirms through `finalized`; go-livepeer uses mined receipts. |
 
 Infrastructure checks report canonical-header, finality, and chain-control requirements separately. Recovery coverage includes expiry, redemption, pending restart, outage, failed transaction, fee cap, delayed finality and reorg scenarios per pairing. Cases needing chain controls fail before dependent setup if those controls are unavailable. Oracle coverage includes all four pairings using fresh funded accounts, active recipients and isolated databases. Active-pool registration is required to obtain valid payment challenges, including for signing and discovery probes.
 

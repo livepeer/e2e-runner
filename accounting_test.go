@@ -275,12 +275,12 @@ func TestClearinghouseManagement(t *testing.T) {
 }
 
 func TestClearinghouseSigning(t *testing.T) {
-	forEachPair(t, func(t *testing.T, orchBackend, signerBackend string) {
+	forEachPair(t, func(t *testing.T, orchBackend, signerBackend string, wallets walletMode) {
 		fixturePoolFor(t)
 		c := preflightChain(t)
 		ch := startClearinghouse(t, c, true)
 		kafkaConfig := ch.signerKafkaConfig(t, signerBackend)
-		f := setupPaid(t, c, orchBackend, signerBackend, ch.webhook+"/v1/signer/authorize", "Livepeer-Clearinghouse-Token: "+ch.signerSecret, kafkaConfig)
+		f := setupPaid(t, c, orchBackend, signerBackend, wallets, ch.webhook+"/v1/signer/authorize", "Livepeer-Clearinghouse-Token: "+ch.signerSecret, kafkaConfig)
 		ch.enableListener(t, f.payer.address.Hex())
 		runClearinghouseAuthorization(t, ch, f)
 		t.Run("signing authorization", func(t *testing.T) {

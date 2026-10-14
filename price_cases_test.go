@@ -85,7 +85,9 @@ func runPriceRegistration(t *testing.T, f *paidFixture) {
 				require.NoError(t, err)
 				require.NoError(t, os.WriteFile(path, data, 0600))
 			}
-			orch := startOrchestrator(t, orchestratorOptions{backend: f.orch.backend, account: f.recipient, chain: f.chain, staticConfigPath: path, noReady: true})
+			opts := f.orchestratorOptions()
+			opts.staticConfigPath, opts.noReady = path, true
+			orch := startOrchestrator(t, opts)
 			// Rejection may terminate startup or leave the server running without the
 			// invalid runner. Accept neither registration nor a hung startup as rejection.
 			deadline := time.Now().Add(envDuration(t, "E2E_READY_TIMEOUT", "30s"))
@@ -126,7 +128,9 @@ func runPriceRegistration(t *testing.T, f *paidFixture) {
 				if runtime {
 					registerStaticRunnerConfig(t, orch, cfg, 200)
 				} else {
-					orch = startOrchestrator(t, orchestratorOptions{backend: f.orch.backend, chain: f.chain, account: f.recipient, staticConfigPath: writeStaticConfig(t, cfg)})
+					opts := f.orchestratorOptions()
+					opts.staticConfigPath = writeStaticConfig(t, cfg)
+					orch = startOrchestrator(t, opts)
 				}
 				runner := waitRunnerByMetadata(t, orch, route)
 				require.Equal(t, "wei", runner.PriceInfo.Currency)

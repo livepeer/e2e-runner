@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/require"
@@ -99,12 +100,24 @@ func forEachOrchestrator(t *testing.T, run func(*testing.T)) {
 		t.Run(backend, func(t *testing.T) { fixturePoolFor(t); run(t) })
 	}
 }
-func forEachPair(t *testing.T, run func(*testing.T, string, string)) {
+
+type walletMode string
+
+const (
+	sameWallet  walletMode = "same-wallet"
+	splitWallet walletMode = "split-wallet"
+)
+
+func forEachPair(t *testing.T, run func(*testing.T, string, string, walletMode)) {
 	t.Helper()
 	for _, orch := range selectedBackends(t, "E2E_ORCHESTRATORS") {
 		t.Run(orch, func(t *testing.T) {
 			for _, signer := range selectedBackends(t, "E2E_SIGNERS") {
-				t.Run(signer, func(t *testing.T) { run(t, orch, signer) })
+				t.Run(signer, func(t *testing.T) {
+					for _, wallets := range []walletMode{sameWallet, splitWallet} {
+						t.Run(string(wallets), func(t *testing.T) { run(t, orch, signer, wallets) })
+					}
+				})
 			}
 		})
 	}
@@ -326,6 +339,9 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 			config["RedeemerDB"] = filepath.Join(dir, "redeemer.sqlite")
 			config["KeystoreFile"] = opts.account.keystore
 			config["KeystorePasswordFile"] = opts.account.passwordFile
+			if opts.recipient != (common.Address{}) {
+				config["OrchestratorAddress"] = opts.recipient.Hex()
+			}
 			config["Network"] = "devenv"
 			config["RPCURLFile"] = secretFile(t, dir, "rpc", opts.chain.url)
 			config["ChainID"] = opts.chain.chainID.Uint64()
@@ -350,6 +366,9 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 			args = append(args, "-network", "offchain")
 		} else {
 			args = append(args, chainFlags(opts.chain, opts.account)...)
+			if opts.recipient != (common.Address{}) {
+				args = append(args, "-ethOrchAddr", opts.recipient.Hex())
+			}
 			args = append(args, "-pricePerUnit", envDefault("E2E_GO_BASE_PRICE_WEI", "1"), "-pixelsPerUnit", "1", "-priceFeedAddr", opts.chain.feed.Hex(), "-ticketEV", envDefault("E2E_TICKET_EV", "200000000000"))
 		}
 		if template != "" {

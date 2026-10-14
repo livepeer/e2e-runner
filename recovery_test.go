@@ -142,6 +142,8 @@ func makeWinning(t *testing.T, f *paidFixture, headers map[string]string) *obser
 		stopPaidSession(t, f.orch, j.route, s.SessionID)
 		j.closeRunner()
 		if ticket := observedWinning(t, f.orch, f.payer.address); ticket != nil {
+			require.Equal(t, f.recipient.address, ticket.Recipient, "persisted winning ticket recipient")
+			require.Equal(t, f.payer.address, ticket.Sender, "persisted winning ticket payer")
 			return ticket
 		}
 	}
@@ -156,6 +158,7 @@ func waitSettlement(t *testing.T, f *paidFixture, ticket *observedTicket) *types
 		if latest == nil || latest.Tx == (common.Hash{}) {
 			return false
 		}
+		require.Equal(t, f.recipient.address, latest.Recipient, "persisted redemption recipient")
 		ctx, cancel := chainContext(t)
 		defer cancel()
 		err := f.chain.rpc.CallContext(ctx, &receipt, "eth_getTransactionReceipt", latest.Tx)
@@ -163,11 +166,38 @@ func waitSettlement(t *testing.T, f *paidFixture, ticket *observedTicket) *types
 	}, envDuration(t, "E2E_REDEMPTION_TIMEOUT", "90s"), 300*time.Millisecond, "redemption receipt: %s", readLog(t, f.orch.logPath))
 	require.Equal(t, uint64(1), receipt.Status)
 	require.Greater(t, receipt.BlockNumber.Uint64(), ticket.Expiry, "randomness revealed after ticket acceptance window")
+	tx, err := f.chain.rpcTransaction(t, receipt.TxHash)
+	require.NoError(t, err)
+	require.NotNil(t, tx)
+	sender, err := types.Sender(types.LatestSignerForChainID(f.chain.chainID), tx)
+	require.NoError(t, err)
+	require.Equal(t, f.redeemer.address, sender, "redemption transaction gas payer")
+	require.NotNil(t, tx.To())
+	require.Equal(t, f.chain.broker, *tx.To(), "redemption contract")
+	event := f.chain.contracts["ticketBroker"].Events["WinningTicketRedeemed"]
+	matched := false
+	for _, log := range receipt.Logs {
+		if log.Address != f.chain.broker || len(log.Topics) == 0 || log.Topics[0] != event.ID {
+			continue
+		}
+		require.Len(t, log.Topics, 3)
+		require.Equal(t, f.payer.address, common.BytesToAddress(log.Topics[1].Bytes()), "redemption event payer")
+		require.Equal(t, f.recipient.address, common.BytesToAddress(log.Topics[2].Bytes()), "redemption event recipient")
+		values, err := event.Inputs.NonIndexed().Unpack(log.Data)
+		require.NoError(t, err)
+		if values[2].(*big.Int).Cmp(ticket.SenderNonce) == 0 && values[3].(*big.Int).Cmp(ticket.Random) == 0 {
+			require.Equal(t, ticket.FaceValue, values[0], "redeemed face value")
+			require.Equal(t, ticket.WinProb, values[1], "redeemed win probability")
+			require.Equal(t, ticket.AuxData, values[4], "redeemed round identity")
+			matched = true
+		}
+	}
+	require.True(t, matched, "receipt must redeem the observed winning ticket")
 	return receipt
 }
 
 func TestOnchainRecovery(t *testing.T) {
-	forEachPair(t, func(t *testing.T, orch, signer string) {
+	forEachPair(t, func(t *testing.T, orch, signer string, wallets walletMode) {
 		for _, scenario := range []string{"expired parameters", "redemption and duplicate", "pending restart", "RPC interruption", "failed transaction", "fee limit", "delayed finality", "reorg recovery"} {
 			t.Run(scenario, func(t *testing.T) {
 				c := preflightChain(t)
@@ -182,7 +212,7 @@ func TestOnchainRecovery(t *testing.T) {
 				if orch == "go-livepeer" {
 					opts.goExtra = []string{"-maxFaceValue", envDefault("E2E_TICKET_FACE_VALUE", "400000000000")}
 				}
-				f := setupPaid(t, c, orch, signer, "", "", nil, opts)
+				f := setupPaid(t, c, orch, signer, wallets, "", "", nil, opts)
 				if scenario == "expired parameters" {
 					j := f.job(t, "hour", "persistent")
 					j.obtainChallenge(t)
@@ -262,7 +292,7 @@ func TestOnchainRecovery(t *testing.T) {
 					opts.goExtra = nil
 					f.orch = startOrchestrator(t, opts)
 				}
-				receipt := waitSettlement(t, f, ticket)
+				waitSettlement(t, f, ticket)
 				if scenario == "delayed finality" && orch == "node" {
 					db := openReadDB(t, paymentDB(f.orch))
 					var count int
@@ -289,6 +319,7 @@ func TestOnchainRecovery(t *testing.T) {
 					require.Equal(t, new(big.Int).Add(deposit, reserve).String(), new(big.Int).Add(deposit2, reserve2).String(), "one canonical settlement after reorg")
 				}
 				if scenario == "redemption and duplicate" || scenario == "failed transaction" {
+					f.orch.process.stop()
 					data, err := c.contracts["ticketBroker"].Pack("redeemWinningTicket", ticket, ticket.Signature, ticket.Random)
 					require.NoError(t, err)
 					if scenario == "failed transaction" {
@@ -299,15 +330,12 @@ func TestOnchainRecovery(t *testing.T) {
 					var output hexutil.Bytes
 					ctx, cancel := chainContext(t)
 					defer cancel()
-					err = c.rpc.CallContext(ctx, &output, "eth_call", map[string]any{"from": f.recipient.address, "to": c.broker, "data": hexutil.Bytes(data)}, "latest")
+					err = c.rpc.CallContext(ctx, &output, "eth_call", map[string]any{"from": f.redeemer.address, "to": c.broker, "data": hexutil.Bytes(data)}, "latest")
 					require.Error(t, err, "duplicate or invalid redemption must revert")
-					failed := c.submit(t, f.recipient.address, f.recipient.key, common.Address{}, c.broker, data, new(big.Int))
+					failed := c.submit(t, f.redeemer.address, f.redeemer.key, common.Address{}, c.broker, data, new(big.Int))
 					require.Equal(t, uint64(0), failed.Status, "failed redemption has an actual reverted receipt")
 					d, r, _ := senderEscrow(t, c, f.payer.address)
 					require.Equal(t, new(big.Int).Add(deposit, reserve).String(), new(big.Int).Add(d, r).String(), "reverted redemption cannot debit escrow twice")
-					tx, err := c.rpcTransaction(t, receipt.TxHash)
-					require.NoError(t, err)
-					require.NotNil(t, tx)
 				}
 			})
 		}
@@ -323,9 +351,9 @@ func (c *chainFixture) rpcTransaction(t *testing.T, hash common.Hash) (*types.Tr
 }
 
 func TestOnchainOracle(t *testing.T) {
-	forEachPair(t, func(t *testing.T, orch, signer string) {
+	forEachPair(t, func(t *testing.T, orch, signer string, wallets walletMode) {
 		c := preflightChain(t)
-		f := setupPaid(t, c, orch, signer, "", "", nil)
+		f := setupPaid(t, c, orch, signer, wallets, "", "", nil)
 		runOracleObservations(t, f)
 	})
 }

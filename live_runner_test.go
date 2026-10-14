@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	liverunner "github.com/livepeer/golang-runner"
 	"github.com/stretchr/testify/require"
 )
@@ -66,6 +67,7 @@ type testOrchestrator struct {
 type orchestratorOptions struct {
 	backend          string
 	account          *chainAccount
+	recipient        common.Address
 	chain            *chainFixture
 	proxyURLTemplate string
 	staticConfigPath string

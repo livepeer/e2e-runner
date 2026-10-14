@@ -12,7 +12,7 @@ import (
 )
 
 func TestClearinghouseChainRecovery(t *testing.T) {
-	forEachPair(t, func(t *testing.T, orch, signer string) {
+	forEachPair(t, func(t *testing.T, orch, signer string, wallets walletMode) {
 		for _, scenario := range []string{"escrow and withdrawal", "matched settlement", "delayed attribution", "unmatched settlement", "ambiguous attribution fixture", "confirmations and checkpoints", "RPC outage", "reorg rollback replay", "reorg beyond boundary"} {
 			t.Run(scenario, func(t *testing.T) {
 				c := preflightChain(t)
@@ -31,7 +31,7 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 				if orch == "go-livepeer" {
 					opts.goExtra = []string{"-maxFaceValue", envDefault("E2E_TICKET_FACE_VALUE", "400000000000")}
 				}
-				f := setupPaid(t, c, orch, signer, ch.webhook+"/v1/signer/authorize", "Livepeer-Clearinghouse-Token: "+ch.signerSecret, kafkaConfig, opts)
+				f := setupPaid(t, c, orch, signer, wallets, ch.webhook+"/v1/signer/authorize", "Livepeer-Clearinghouse-Token: "+ch.signerSecret, kafkaConfig, opts)
 				ch.config["ReorgLookback"] = int64(8)
 				ch.enableListener(t, f.payer.address.Hex())
 				waitChainCheckpoint(t, ch, c.block(t)-2)

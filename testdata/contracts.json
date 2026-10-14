@@ -413,6 +413,48 @@
   ],
   "ticketBroker": [
     {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "sender",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "recipient",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "faceValue",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "winProb",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "senderNonce",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "recipientRand",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "auxData",
+          "type": "bytes"
+        }
+      ],
+      "name": "WinningTicketRedeemed",
+      "type": "event"
+    },
+    {
       "inputs": [],
       "name": "cancelUnlock",
       "outputs": [],

@@ -201,8 +201,10 @@ func (j *paymentJob) obtainChallenge(t *testing.T, payerOverride ...common.Addre
 	require.Equal(t, 402, status, string(body))
 	require.NoError(t, json.Unmarshal(body, &j.challenge))
 	require.NotEmpty(t, j.challenge.PaymentParams, string(body))
+	info := decode64(t, j.challenge.PaymentParams)
+	require.Equal(t, j.orch.infoAddress().Bytes(), wireBytes(t, info, 4), "orchestrator service identity")
+	require.Equal(t, j.orch.paymentRecipient().Bytes(), wireBytes(t, wireBytes(t, info, 2), 1), "challenge ticket recipient")
 	if j.challenge.ManifestID == "" {
-		info := decode64(t, j.challenge.PaymentParams)
 		j.challenge.ManifestID = string(wireBytes(t, wireBytes(t, info, 6), 2))
 	}
 	require.NotEmpty(t, j.challenge.ManifestID)
@@ -231,6 +233,7 @@ func (j *paymentJob) sign(t *testing.T, headers map[string]string) {
 	require.NotEmpty(t, j.payment.State)
 	payment := decode64(t, j.payment.Payment)
 	require.Equal(t, j.signer.account.address.Bytes(), wireBytes(t, payment, 2), "payment payer identity")
+	require.Equal(t, j.orch.paymentRecipient().Bytes(), wireBytes(t, wireBytes(t, payment, 1), 1), "signed ticket recipient")
 }
 func (j *paymentJob) headers() map[string]string {
 	return map[string]string{"Livepeer-Payer-Address": j.signer.account.address.Hex(), "Livepeer-Payment": j.payment.Payment, "Livepeer-Segment": j.payment.Segment}
@@ -321,28 +324,38 @@ func stateObject(t *testing.T, p signedPayment) map[string]any {
 }
 
 type paidFixture struct {
-	owner            *testing.T
-	chain            *chainFixture
-	recipient, payer *chainAccount
-	orch             *testOrchestrator
-	signer           *testSigner
-	upstream         *httptestServerCount
+	owner                      *testing.T
+	chain                      *chainFixture
+	recipient, redeemer, payer *chainAccount
+	orch                       *testOrchestrator
+	signer                     *testSigner
+	upstream                   *httptestServerCount
 }
 type httptestServerCount struct {
 	url   string
 	calls atomic.Int64
 }
 
-func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string, webhook, headers string, kafka map[string]any, overrides ...orchestratorOptions) *paidFixture {
+func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string, wallets walletMode, webhook, headers string, kafka map[string]any, overrides ...orchestratorOptions) *paidFixture {
 	t.Helper()
 	fixturePoolFor(t)
+	require.Contains(t, []walletMode{sameWallet, splitWallet}, wallets)
 	c.configureFunding(t)
 	recipient := c.newAccount(t, true)
+	redeemer := recipient
+	if wallets == splitWallet {
+		redeemer = c.newAccount(t, true)
+		require.NotEqual(t, recipient.address, redeemer.address, "split recipient and redeemer")
+	}
 	payer := c.newAccount(t, true)
 	c.fundPayer(t, payer, ethAmount(t, "E2E_PAYER_DEPOSIT_ETH", "0.1"), ethAmount(t, "E2E_PAYER_RESERVE_ETH", "0.1"))
 	c.activate(t, recipient)
+	if wallets == splitWallet {
+		require.False(t, c.call(t, "bondingManager", c.bonding, "isActiveTranscoder", redeemer.address)[0].(bool), "hot wallet must not be an active orchestrator")
+	}
 	c.setupFeed(t, payer)
-	f := &paidFixture{owner: t, chain: c, recipient: recipient, payer: payer, upstream: &httptestServerCount{}}
+	t.Logf("wallets=%s recipient=%s redeemer=%s payer=%s", wallets, recipient.address, redeemer.address, payer.address)
+	f := &paidFixture{owner: t, chain: c, recipient: recipient, redeemer: redeemer, payer: payer, upstream: &httptestServerCount{}}
 	server := newFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			w.WriteHeader(200)
@@ -356,10 +369,34 @@ func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string,
 	if len(overrides) > 0 {
 		opts = overrides[0]
 	}
-	opts.backend, opts.account, opts.chain = orchBackend, recipient, c
+	opts.backend, opts.account, opts.chain = orchBackend, redeemer, c
+	if wallets == splitWallet {
+		opts.recipient = recipient.address
+	}
 	f.orch = startOrchestrator(t, opts)
 	f.signer = startSigner(t, signerOptions{backend: signerBackend, chain: c, account: payer, orch: f.orch, webhook: webhook, webhookHeaders: headers, kafka: kafka})
 	return f
+}
+
+// Fresh secondary processes share wallet roles, but get their own state directory.
+func (f *paidFixture) orchestratorOptions() orchestratorOptions {
+	return orchestratorOptions{backend: f.orch.backend, account: f.redeemer, recipient: f.orch.opts.recipient, chain: f.chain}
+}
+
+func (orch *testOrchestrator) paymentRecipient() common.Address {
+	if orch.opts.recipient != (common.Address{}) {
+		return orch.opts.recipient
+	}
+	return orch.opts.account.address
+}
+
+// go-livepeer advertises its service signing account separately from the ticket
+// recipient; Node advertises the registered recipient in both fields.
+func (orch *testOrchestrator) infoAddress() common.Address {
+	if orch.backend == "go-livepeer" {
+		return orch.opts.account.address
+	}
+	return orch.paymentRecipient()
 }
 func (f *paidFixture) register(t *testing.T, label, mode, unit string, proxy bool) heartbeatResponse {
 	t.Helper()
@@ -435,9 +472,9 @@ func maintainRunner(t *testing.T, orch *testOrchestrator, reg heartbeatResponse,
 }
 
 func TestOnchainPayments(t *testing.T) {
-	forEachPair(t, func(t *testing.T, orchBackend, signerBackend string) {
+	forEachPair(t, func(t *testing.T, orchBackend, signerBackend string, wallets walletMode) {
 		c := preflightChain(t)
-		f := setupPaid(t, c, orchBackend, signerBackend, "", "", nil)
+		f := setupPaid(t, c, orchBackend, signerBackend, wallets, "", "", nil)
 		t.Run("identity", func(t *testing.T) {
 			status, body := httpJSON(t, "POST", f.signer.base+"/sign-orchestrator-info", nil, nil)
 			require.Equal(t, 200, status)
@@ -519,7 +556,7 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 		require.Equal(t, before, f.upstream.calls.Load())
 		requireRunnerCapacity(t, requireDiscoveredRunner(t, f.orch, j.route), 2, 0, 2)
 		info := decode64(t, j.challenge.PaymentParams)
-		require.Equal(t, f.recipient.address.Bytes(), wireBytes(t, info, 4))
+		require.Equal(t, f.orch.infoAddress().Bytes(), wireBytes(t, info, 4))
 		j.sign(t, nil)
 		s := j.submit(t)
 		requireRunnerCapacity(t, requireDiscoveredRunner(t, f.orch, j.route), 2, 1, 1)
