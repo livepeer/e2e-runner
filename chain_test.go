@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,11 +32,28 @@ type chainAccount struct {
 	key                    *ecdsa.PrivateKey
 	address                common.Address
 	keystore, passwordFile string
+	runScoped              bool
 }
+
+type recipientChain struct {
+	chainID    string
+	genesis    common.Hash
+	controller common.Address
+}
+
+// Hold the lease until fixture cleanup has stopped every worker and restored
+// snapshots. Only account material survives; RPC clients and databases do not.
+var paidRecipients = struct {
+	sync.Mutex
+	accounts map[recipientChain]*chainAccount
+	dirs     []string
+}{accounts: make(map[recipientChain]*chainAccount)}
+
 type chainFixture struct {
-	url                                              string
+	url, setupURL                                    string
 	rpc                                              *rpc.Client
 	chainID                                          *big.Int
+	genesis                                          common.Hash
 	controller, broker, bonding, rounds, token, feed common.Address
 	funder, lptFunder                                common.Address
 	fundingKey                                       *ecdsa.PrivateKey
@@ -56,6 +74,7 @@ func (c *chainFixture) request(t *testing.T, out any, method string, args ...any
 func preflightChain(t *testing.T) *chainFixture {
 	t.Helper()
 	c := &chainFixture{url: os.Getenv("E2E_RPC_URL"), contracts: map[string]abi.ABI{}}
+	c.setupURL = c.url
 	require.NotEmpty(t, c.url, "INFRASTRUCTURE: E2E_RPC_URL is required")
 	expected := os.Getenv("E2E_EXPECTED_CHAIN_ID")
 	require.NotEmpty(t, expected, "INFRASTRUCTURE: E2E_EXPECTED_CHAIN_ID is required")
@@ -69,6 +88,10 @@ func preflightChain(t *testing.T) *chainFixture {
 	var id hexutil.Big
 	c.request(t, &id, "eth_chainId")
 	c.chainID = new(big.Int).Set((*big.Int)(&id))
+	var genesis struct{ Hash common.Hash }
+	c.request(t, &genesis, "eth_getBlockByNumber", "0x0", false)
+	require.NotEqual(t, common.Hash{}, genesis.Hash, "INFRASTRUCTURE: missing genesis block")
+	c.genesis = genesis.Hash
 	require.Equal(t, expected, c.chainID.String(), "INFRASTRUCTURE: unexpected chain")
 	c.controller = common.HexToAddress(os.Getenv("E2E_ETH_CONTROLLER"))
 	var raw map[string]json.RawMessage
@@ -135,18 +158,111 @@ func (c *chainFixture) configureFunding(t *testing.T) {
 		require.True(t, common.IsHexAddress(address), "E2E_LPT_FUNDER_ADDRESS")
 		c.lptFunder = common.HexToAddress(address)
 	} else {
-		needed := c.selfBondAmount(t)
+		largest := new(big.Int)
 		for _, account := range append([]common.Address{c.funder}, accounts...) {
-			if c.call(t, "livepeerToken", c.token, "balanceOf", account)[0].(*big.Int).Cmp(needed) >= 0 {
+			balance := c.call(t, "livepeerToken", c.token, "balanceOf", account)[0].(*big.Int)
+			if balance.Cmp(largest) > 0 {
 				c.lptFunder = account
-				break
+				largest = balance
 			}
 		}
 	}
 	if c.lptFunder == (common.Address{}) {
 		c.lptFunder = c.funder
 	}
-	c.ensureLPT(t, c.lptFunder, c.selfBondAmount(t))
+}
+
+func (c *chainFixture) paidRecipient(t *testing.T, isolated bool) *chainAccount {
+	t.Helper()
+	paidRecipients.Lock()
+	// Registered before any fixture workers or snapshot cleanup: LIFO cleanup
+	// releases the next fixture only after all of those have completed.
+	t.Cleanup(paidRecipients.Unlock)
+	if isolated {
+		a := c.newAccount(t, true)
+		c.activate(t, a)
+		return a
+	}
+	identity := recipientChain{c.chainID.String(), c.genesis, c.controller}
+	a, attempted := paidRecipients.accounts[identity]
+	if !attempted {
+		// A failed first setup must fail dependent fixtures, not create more
+		// registered recipients. The account itself is published only on success.
+		paidRecipients.accounts[identity] = nil
+		// Compose's TMPDIR is within its shared run-root mount. Local mode uses
+		// the host's private temporary directory. Neither belongs to testing.T.
+		base := ""
+		if composeMode() {
+			root := os.Getenv("E2E_RUN_ROOT")
+			require.NotEmpty(t, root, "INFRASTRUCTURE: Compose recipient needs the shared E2E_RUN_ROOT")
+			base = filepath.Join(root, "tmp")
+		}
+		dir, err := os.MkdirTemp(base, "e2e-scope-recipient-")
+		require.NoError(t, err)
+		paidRecipients.dirs = append(paidRecipients.dirs, dir)
+		a = c.createAccountIn(t, "node", dir)
+		a.runScoped = true
+		c.send(t, c.funder, c.fundingKey, common.Address{}, a.address, nil, ethAmount(t, "E2E_ACCOUNT_ETH", "1"))
+		c.activate(t, a)
+		// Failed funding/registration must never publish a partially set up R.
+		paidRecipients.accounts[identity] = a
+		t.Logf("run recipient activated=%s", a.address)
+	} else {
+		require.NotNil(t, a, "INFRASTRUCTURE: run recipient setup failed earlier; see the first paid fixture")
+		if c.cliAccounts == nil {
+			c.cliAccounts = make(map[common.Address]*chainAccount)
+		}
+		c.cliAccounts[a.address] = a
+		c.waitAccountIdle(t, a.address)
+		c.initializeRound(t, a)
+		delegator := c.call(t, "bondingManager", c.bonding, "getDelegator", a.address)
+		require.Positive(t, delegator[0].(*big.Int).Sign(), "run recipient lost its bond; staking cases must request an isolated recipient")
+		require.Equal(t, a.address, delegator[2].(common.Address), "run recipient must remain self-bonded")
+		if !c.inTranscoderPool(t, a.address) {
+			// A displaced, still registered recipient needs only the difference
+			// between the pool entry threshold and its existing total stake.
+			// Repair membership even if deactivation is scheduled for next round.
+			stake := c.call(t, "bondingManager", c.bonding, "transcoderTotalStake", a.address)[0].(*big.Int)
+			additional := new(big.Int).Sub(c.selfBondAmount(t), stake)
+			if additional.Sign() <= 0 {
+				// The CLI skips unchanged registration settings and requires a
+				// positive bond. One base unit updates membership in an open slot.
+				additional.SetInt64(1)
+			}
+			t.Logf("run recipient stake adjustment=%s additional=%s LPT base units", a.address, additional)
+			c.fundStake(t, a, additional)
+			c.roundTransaction(t, a, "bond", additional, a.address)
+		}
+		if !c.recipientActive(t, a) {
+			c.waitRecipientActive(t, a)
+		}
+		t.Logf("run recipient reused=%s", a.address)
+	}
+	return a
+}
+
+func cleanupPaidRecipients() error {
+	paidRecipients.Lock()
+	defer paidRecipients.Unlock()
+	var first error
+	for _, dir := range paidRecipients.dirs {
+		if err := os.RemoveAll(dir); err != nil && first == nil {
+			first = err
+		}
+	}
+	paidRecipients.accounts = make(map[recipientChain]*chainAccount)
+	paidRecipients.dirs = nil
+	return first
+}
+
+func (c *chainFixture) waitAccountIdle(t *testing.T, address common.Address) {
+	t.Helper()
+	eventually(t, func() bool {
+		var pending, mined hexutil.Uint64
+		c.request(t, &pending, "eth_getTransactionCount", address, "pending")
+		c.request(t, &mined, "eth_getTransactionCount", address, "latest")
+		return pending == mined
+	}, envDuration(t, "E2E_TRANSACTION_TIMEOUT", "45s"), 200*time.Millisecond, "INFRASTRUCTURE: outstanding transactions from %s before setup submission", address)
 }
 func ethAmount(t *testing.T, key, fallback string) *big.Int {
 	t.Helper()
@@ -192,6 +308,9 @@ func (c *chainFixture) send(t *testing.T, from common.Address, key *ecdsa.Privat
 }
 func (c *chainFixture) submit(t *testing.T, from common.Address, key *ecdsa.PrivateKey, deploy, to common.Address, data []byte, value *big.Int) *types.Receipt {
 	t.Helper()
+	if a := c.cliAccounts[from]; a != nil && a.runScoped {
+		c.waitAccountIdle(t, from)
+	}
 	var hash common.Hash
 	if key == nil {
 		tx := map[string]any{"from": from, "data": hexutil.Bytes(data), "value": (*hexutil.Big)(value), "gas": hexutil.Uint64(6000000)}
@@ -252,32 +371,68 @@ func (c *chainFixture) fundPayer(t *testing.T, a *chainAccount, deposit, reserve
 func (c *chainFixture) activate(t *testing.T, a *chainAccount) {
 	t.Helper()
 	amount := c.selfBondAmount(t)
-	c.ensureLPT(t, c.lptFunder, amount)
 	t.Logf("fresh orchestrator=%s self-bond=%s LPT base units", a.address, amount)
+	c.fundStake(t, a, amount)
+	c.initializeRound(t, a)
+	c.roundTransaction(t, a, "bond", amount, a.address)
+	c.waitUnlockedRound(t, a)
+	c.roundTransaction(t, a, "transcoder", big.NewInt(100000), big.NewInt(500000))
+	c.waitRecipientActive(t, a)
+}
+
+func (c *chainFixture) fundStake(t *testing.T, a *chainAccount, amount *big.Int) {
+	t.Helper()
+	balance := c.call(t, "livepeerToken", c.token, "balanceOf", a.address)[0].(*big.Int)
+	missing := new(big.Int).Sub(amount, balance)
+	if missing.Sign() <= 0 {
+		return
+	}
+	c.ensureLPT(t, c.lptFunder, missing)
 	var transferAccount *chainAccount
 	if c.lptFunder == c.funder {
 		if c.fundingKey != nil {
 			transferAccount = c.accountFromKey(t, c.fundingKey)
 		}
 	}
-	c.transferLPT(t, c.lptFunder, transferAccount, a.address, amount)
-	c.initializeRound(t, a)
-	c.roundTransaction(t, a, "bond", amount, a.address)
-	c.waitUnlockedRound(t, a)
-	c.roundTransaction(t, a, "transcoder", big.NewInt(100000), big.NewInt(500000))
+	c.transferLPT(t, c.lptFunder, transferAccount, a.address, missing)
+}
+
+func (c *chainFixture) recipientActive(t *testing.T, a *chainAccount) bool {
+	t.Helper()
+	if !c.call(t, "bondingManager", c.bonding, "isActiveTranscoder", a.address)[0].(bool) {
+		return false
+	}
+	activated := c.transcoderRound(t, a.address, "activationRound")
+	initialized := c.call(t, "roundsManager", c.rounds, "lastInitializedRound")[0].(*big.Int)
+	return initialized.Cmp(activated) >= 0
+}
+
+func (c *chainFixture) waitRecipientActive(t *testing.T, a *chainAccount) {
+	t.Helper()
 	deadline := time.Now().Add(envDuration(t, "E2E_ACTIVATION_TIMEOUT", "3m"))
 	for time.Now().Before(deadline) {
 		c.initializeRound(t, a)
-		if c.call(t, "bondingManager", c.bonding, "isActiveTranscoder", a.address)[0].(bool) {
-			activated := c.transcoderRound(t, a.address, "activationRound")
-			initialized := c.call(t, "roundsManager", c.rounds, "lastInitializedRound")[0].(*big.Int)
-			if initialized.Cmp(activated) >= 0 {
-				return
-			}
+		if c.recipientActive(t, a) {
+			return
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	t.Fatal("INFRASTRUCTURE: freshly registered orchestrator did not become active before E2E_ACTIVATION_TIMEOUT; check round length, initialization and transcoder pool stake")
+}
+
+func (c *chainFixture) inTranscoderPool(t *testing.T, address common.Address) bool {
+	t.Helper()
+	size := c.call(t, "bondingManager", c.bonding, "getTranscoderPoolSize")[0].(*big.Int)
+	require.True(t, size.IsUint64() && size.Uint64() <= 10000, "INFRASTRUCTURE: pool traversal limit")
+	member := c.call(t, "bondingManager", c.bonding, "getFirstTranscoderInPool")[0].(common.Address)
+	for n := uint64(0); n < size.Uint64(); n++ {
+		require.NotEqual(t, common.Address{}, member, "INFRASTRUCTURE: inconsistent transcoder pool")
+		if member == address {
+			return true
+		}
+		member = c.call(t, "bondingManager", c.bonding, "getNextTranscoderInPool", member)[0].(common.Address)
+	}
+	return false
 }
 
 func (c *chainFixture) selfBondAmount(t *testing.T) *big.Int {
@@ -422,11 +577,15 @@ func (c *chainFixture) requireFinality(t *testing.T) {
 	require.NoError(t, err, "INFRASTRUCTURE: RPC must support finalized blocks for Node redemption confirmation; latest is not a substitute")
 	require.NotEqual(t, "null", string(block), "INFRASTRUCTURE: no finalized block")
 }
-func (c *chainFixture) requireControl(t *testing.T) string {
+func (c *chainFixture) checkControl(t *testing.T) {
 	t.Helper()
 	var modules map[string]string
 	c.request(t, &modules, "rpc_modules")
 	require.Contains(t, modules, "evm", "INFRASTRUCTURE: snapshot/revert, expiry and reorg tests need evm controls")
+}
+func (c *chainFixture) requireControl(t *testing.T, recipient ...*chainAccount) string {
+	t.Helper()
+	c.checkControl(t)
 	var snapshot string
 	c.request(t, &snapshot, "evm_snapshot")
 	t.Cleanup(func() {
@@ -435,6 +594,11 @@ func (c *chainFixture) requireControl(t *testing.T) string {
 		defer cancel()
 		if err := c.rpc.CallContext(ctx, &restored, "evm_revert", snapshot); err != nil || !restored {
 			t.Errorf("INFRASTRUCTURE: snapshot restore failed: %v", err)
+			return
+		}
+		if len(recipient) > 0 {
+			c.initializeRound(t, recipient[0])
+			require.True(t, c.recipientActive(t, recipient[0]), "recipient remains active after snapshot restore")
 		}
 	})
 	return snapshot

@@ -17,7 +17,7 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 			t.Run(scenario, func(t *testing.T) {
 				c := preflightChain(t)
 				c.requireCanonicalHeaders(t)
-				c.requireControl(t)
+				c.checkControl(t)
 				if orch == "node" {
 					c.requireFinality(t)
 				}
@@ -31,7 +31,7 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 				if orch == "go-livepeer" {
 					opts.goExtra = []string{"-maxFaceValue", envDefault("E2E_TICKET_FACE_VALUE", "400000000000")}
 				}
-				f := setupPaid(t, c, orch, signer, wallets, ch.webhook+"/v1/signer/authorize", "Livepeer-Clearinghouse-Token: "+ch.signerSecret, kafkaConfig, opts)
+				f := setupPaid(t, c, orch, signer, wallets, ch.webhook+"/v1/signer/authorize", "Livepeer-Clearinghouse-Token: "+ch.signerSecret, kafkaConfig, paidSetupOptions{orchestrator: opts, snapshot: true})
 				ch.config["ReorgLookback"] = int64(8)
 				ch.enableListener(t, f.payer.address.Hex())
 				waitChainCheckpoint(t, ch, c.block(t)-2)
@@ -84,6 +84,10 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 					var restored bool
 					c.request(t, &restored, "evm_revert", snapshot)
 					require.True(t, restored)
+					// Orchestrator workers still run in this listener-only reorg;
+					// initialize through the fixture payer to avoid racing R's nonce.
+					c.initializeRound(t, f.payer)
+					require.True(t, c.recipientActive(t, f.recipient), "recipient remains active after reorg")
 					c.mineTo(t, c.block(t)+4)
 					ch.restart(t)
 					if scenario == "reorg beyond boundary" {
@@ -109,6 +113,7 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 				headers := k.headers()
 				if scenario == "unmatched settlement" {
 					opts := f.signer.opts
+					opts.dir = ""
 					opts.kafka = nil
 					f.signer = startSigner(t, opts)
 				}

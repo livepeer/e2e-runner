@@ -336,22 +336,39 @@ type httptestServerCount struct {
 	calls atomic.Int64
 }
 
-func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string, wallets walletMode, webhook, headers string, kafka map[string]any, overrides ...orchestratorOptions) *paidFixture {
+type paidSetupOptions struct {
+	orchestrator      orchestratorOptions
+	isolatedRecipient bool // Required when a case deliberately changes staking.
+	snapshot          bool // Snapshot after R setup, before fixture workers start.
+}
+
+func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string, wallets walletMode, webhook, headers string, kafka map[string]any, overrides ...paidSetupOptions) *paidFixture {
 	t.Helper()
 	fixturePoolFor(t)
 	require.Contains(t, []walletMode{sameWallet, splitWallet}, wallets)
+	options := paidSetupOptions{}
+	if len(overrides) > 0 {
+		options = overrides[0]
+	}
 	c.configureFunding(t)
-	recipient := c.newAccount(t, true)
+	recipient := c.paidRecipient(t, options.isolatedRecipient)
+	if options.snapshot {
+		c.requireControl(t, recipient)
+	}
+	require.True(t, c.recipientActive(t, recipient), "paid recipient must be active")
 	redeemer := recipient
 	if wallets == splitWallet {
-		redeemer = c.newAccount(t, true)
+		redeemer = c.newAccount(t, false)
+		gas := ethAmount(t, "E2E_REDEEMER_ETH", "0.01")
+		require.Positive(t, gas.Sign(), "E2E_REDEEMER_ETH")
+		c.send(t, c.funder, c.fundingKey, common.Address{}, redeemer.address, nil, gas)
 		require.NotEqual(t, recipient.address, redeemer.address, "split recipient and redeemer")
 	}
 	payer := c.newAccount(t, true)
 	c.fundPayer(t, payer, ethAmount(t, "E2E_PAYER_DEPOSIT_ETH", "0.1"), ethAmount(t, "E2E_PAYER_RESERVE_ETH", "0.1"))
-	c.activate(t, recipient)
 	if wallets == splitWallet {
 		require.False(t, c.call(t, "bondingManager", c.bonding, "isActiveTranscoder", redeemer.address)[0].(bool), "hot wallet must not be an active orchestrator")
+		require.Zero(t, c.call(t, "livepeerToken", c.token, "balanceOf", redeemer.address)[0].(*big.Int).Sign(), "hot wallet must receive no LPT funding")
 	}
 	c.setupFeed(t, payer)
 	t.Logf("wallets=%s recipient=%s redeemer=%s payer=%s", wallets, recipient.address, redeemer.address, payer.address)
@@ -365,11 +382,9 @@ func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string,
 		respondJSON(t, w, map[string]any{"paid": true, "prompt": "hello"})
 	}))
 	f.upstream.url = server.URL
-	opts := orchestratorOptions{}
-	if len(overrides) > 0 {
-		opts = overrides[0]
-	}
+	opts := options.orchestrator
 	opts.backend, opts.account, opts.chain = orchBackend, redeemer, c
+	opts.recipient = common.Address{}
 	if wallets == splitWallet {
 		opts.recipient = recipient.address
 	}
@@ -775,7 +790,9 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 				f.signer = startSigner(f.owner, f.signer.opts)
 				j.signer = f.signer
 			} else {
-				j.signer = startSigner(t, f.signer.opts)
+				opts := f.signer.opts
+				opts.dir = ""
+				j.signer = startSigner(t, opts)
 			}
 			j.sign(t, nil)
 			next := stateObject(t, j.payment)

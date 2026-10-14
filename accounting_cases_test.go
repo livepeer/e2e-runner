@@ -184,6 +184,7 @@ func runFullOutbox(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 		restore := func() { ch.config["EnableKafka"] = true; restoreAccounting() }
 		defer restore()
 		opts := f.signer.opts
+		opts.dir = ""
 		opts.kafka = cloneMap(opts.kafka)
 		opts.kafka["OutboxDB"] = filepath.Join(t.TempDir(), "full-outbox.sqlite")
 		opts.kafka["OutboxMaxBytes"] = int64(10000)

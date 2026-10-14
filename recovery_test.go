@@ -202,7 +202,7 @@ func TestOnchainRecovery(t *testing.T) {
 			t.Run(scenario, func(t *testing.T) {
 				c := preflightChain(t)
 				if scenario == "expired parameters" || scenario == "reorg recovery" {
-					c.requireControl(t)
+					c.checkControl(t)
 				}
 				if orch == "node" && scenario != "expired parameters" {
 					c.requireFinality(t)
@@ -212,7 +212,8 @@ func TestOnchainRecovery(t *testing.T) {
 				if orch == "go-livepeer" {
 					opts.goExtra = []string{"-maxFaceValue", envDefault("E2E_TICKET_FACE_VALUE", "400000000000")}
 				}
-				f := setupPaid(t, c, orch, signer, wallets, "", "", nil, opts)
+				f := setupPaid(t, c, orch, signer, wallets, "", "", nil, paidSetupOptions{orchestrator: opts, snapshot: scenario == "expired parameters" || scenario == "reorg recovery"})
+				normalOptions := f.orch.opts
 				if scenario == "expired parameters" {
 					j := f.job(t, "hour", "persistent")
 					j.obtainChallenge(t)
@@ -255,9 +256,10 @@ func TestOnchainRecovery(t *testing.T) {
 					faults.highFee.Store(true)
 					f.orch.process.stop()
 					opts := f.orch.opts
-					opts.extra = map[string]any{"RedeemerMaxFeePerGas": "1"}
+					opts.extra = cloneMap(opts.extra)
+					opts.extra["RedeemerMaxFeePerGas"] = "1"
 					if orch == "go-livepeer" {
-						opts.goExtra = []string{"-maxGasPrice", "1"}
+						opts.goExtra = append(append([]string{}, opts.goExtra...), "-maxGasPrice", "1")
 					}
 					f.orch = startOrchestrator(t, opts)
 				}
@@ -287,10 +289,7 @@ func TestOnchainRecovery(t *testing.T) {
 					f.orch.process.stop()
 					faults.down.Store(false)
 					faults.highFee.Store(false)
-					opts := f.orch.opts
-					opts.extra = nil
-					opts.goExtra = nil
-					f.orch = startOrchestrator(t, opts)
+					f.orch = startOrchestrator(t, normalOptions)
 				}
 				waitSettlement(t, f, ticket)
 				if scenario == "delayed finality" && orch == "node" {
@@ -307,10 +306,12 @@ func TestOnchainRecovery(t *testing.T) {
 				deposit, reserve, _ := senderEscrow(t, c, f.payer.address)
 				require.Negative(t, new(big.Int).Sub(new(big.Int).Add(deposit, reserve), new(big.Int).Add(beforeDeposit, beforeReserve)).Sign(), "redemption debits escrow")
 				if scenario == "reorg recovery" {
+					f.orch.process.stop()
 					var restored bool
 					c.request(t, &restored, "evm_revert", snapshot)
 					require.True(t, restored)
-					f.orch.process.stop()
+					c.initializeRound(t, f.recipient)
+					require.True(t, c.recipientActive(t, f.recipient), "recipient remains active after reorg")
 					f.orch = startOrchestrator(t, f.orch.opts)
 					c.mineTo(t, ticket.Expiry+3)
 					_ = waitSettlement(t, f, ticket)

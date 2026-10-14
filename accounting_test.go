@@ -474,6 +474,7 @@ func runSignerAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture)
 	})
 	t.Run("outbox capacity withholds payment", func(t *testing.T) {
 		opts := f.signer.opts
+		opts.dir = ""
 		opts.kafka = cloneMap(opts.kafka)
 		opts.kafka["OutboxDB"] = filepath.Join(t.TempDir(), "tiny.sqlite")
 		opts.kafka["OutboxMaxBytes"] = int64(1)

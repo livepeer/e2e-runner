@@ -381,6 +381,10 @@ func runFundingCases(t *testing.T, f *paidFixture) {
 	}{{"no deposit", "0", "0.1"}, {"no reserve", "0.1", "0"}, {"insufficient deposit", "0.000000000000000001", "0.1"}, {"withdrawing", "0.1", "0.1"}} {
 		t.Run("funding/"+tc.name, func(t *testing.T) {
 			if tc.name == "withdrawing" {
+				t.Cleanup(func() {
+					f.chain.initializeRound(t, f.payer)
+					require.True(t, f.chain.recipientActive(t, f.recipient), "recipient remains active after snapshot restore")
+				})
 				f.chain.requireControl(t)
 			}
 			a := f.chain.newAccount(t, true)

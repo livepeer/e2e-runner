@@ -64,6 +64,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	code := m.Run()
+	if err := cleanupPaidRecipients(); err != nil {
+		fmt.Fprintln(os.Stderr, "remove run recipient material:", err)
+		code = 1
+	}
 	stopPooledTunnels()
 	stopCompose()
 	if composeCleanupFailed.Load() && code == 0 {

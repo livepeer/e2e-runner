@@ -32,7 +32,11 @@ import (
 // startup creation path is exercised separately by the CLI comparison suite.
 func (c *chainFixture) createAccount(t *testing.T, backend string) *chainAccount {
 	t.Helper()
-	dir := t.TempDir()
+	return c.createAccountIn(t, backend, t.TempDir())
+}
+
+func (c *chainFixture) createAccountIn(t *testing.T, backend, dir string) *chainAccount {
+	t.Helper()
 	password := uuid.NewString()
 	a := &chainAccount{passwordFile: secretFile(t, dir, "password", password)}
 	var reported common.Address
@@ -106,9 +110,14 @@ func (c *chainFixture) nodeCLI(t *testing.T, a *chainAccount, submit bool, comma
 	t.Helper()
 	bin := binary(t, "node")
 	dir := filepath.Dir(a.keystore)
-	args := []string{"chain", "--rpc-url-file", secretFile(t, dir, "chain-rpc", c.url), "--chain-id", c.chainID.String(), "--controller-address", c.controller.Hex(), "--account", a.address.Hex(), "--output", "json"}
+	// Setup follows the same real endpoint as c.rpc; c.url may be a fault
+	// proxy for fixture workers, including during snapshot cleanup.
+	args := []string{"chain", "--rpc-url-file", secretFile(t, dir, "chain-rpc", c.setupURL), "--chain-id", c.chainID.String(), "--controller-address", c.controller.Hex(), "--account", a.address.Hex(), "--output", "json"}
 	args = append(args, command...)
 	if submit {
+		if a.runScoped {
+			c.waitAccountIdle(t, a.address)
+		}
 		args = append(args, "--submit", "--keystore-file", a.keystore, "--keystore-password-file", a.passwordFile, "--transaction-timeout", envDefault("E2E_TRANSACTION_TIMEOUT", "45s"))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_CLI_TIMEOUT", "2m"))
