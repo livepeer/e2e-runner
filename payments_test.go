@@ -57,7 +57,7 @@ func startSigner(t *testing.T, opts signerOptions) *testSigner {
 	metricsAddr := freeAddr(t)
 	var args []string
 	if opts.backend == "node" {
-		config := map[string]any{"Listen": addr, "MetricsListen": metricsAddr, "KeystoreFile": opts.account.keystore, "KeystorePasswordFile": opts.account.passwordFile, "RPCURLFile": secretFile(t, dir, "rpc", opts.chain.url), "ChainID": opts.chain.chainID.Uint64(), "Controller": opts.chain.controller.Hex(), "MaxHourlyPrice": envDefault("E2E_SIGNER_MAX_HOURLY_USD", "100"), "MaxFixedPrice": envDefault("E2E_SIGNER_MAX_FIXED_USD", "1"), "WeiPerUSD": envDefault("E2E_WEI_PER_USD", "1000000000000000"), "Orchestrators": []string{opts.orch.httpBase}, "DiscoveryGrants": []string{opts.orch.httpBase}}
+		config := map[string]any{"Listen": addr, "MetricsListen": metricsAddr, "KeystoreFile": opts.account.keystore, "KeystorePasswordFile": opts.account.passwordFile, "RPCURLFile": secretFile(t, dir, "rpc", opts.chain.url), "ChainID": opts.chain.chainID.Uint64(), "Controller": opts.chain.controller.Hex(), "MaxHourlyPrice": envDefault("E2E_SIGNER_MAX_HOURLY_USD", "100"), "MaxFixedPrice": envDefault("E2E_SIGNER_MAX_FIXED_USD", "1"), "WeiPerUSD": envDefault("E2E_WEI_PER_USD", "1000000000000000"), "Orchestrators": []string{opts.orch.httpBase}, "DiscoveryGrants": []string{opts.orch.httpAddr}}
 		if opts.useOracle {
 			delete(config, "WeiPerUSD")
 			config["ETHUSDFeed"] = opts.chain.feed.Hex()

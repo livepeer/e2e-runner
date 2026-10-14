@@ -291,7 +291,7 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 		require.NoError(t, err)
 		template = strings.ReplaceAll(template, "{http_port}", port)
 	}
-	orch := &testOrchestrator{backend: backend, httpBase: base, cliBase: publicURL(t, "http://"+cliAddr), proxyURLTemplate: template}
+	orch := &testOrchestrator{backend: backend, httpBase: base, httpAddr: httpAddr, cliBase: publicURL(t, "http://"+cliAddr), proxyURLTemplate: template}
 	var args []string
 	var dir string
 	stateDir := opts.dir
@@ -306,8 +306,8 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 		}
 		orch.cliBase = base
 		config := map[string]any{"Listen": httpAddr, "MetricsListen": cliAddr, "ServiceURL": base, "BootstrapSecretFile": secretFile(t, dir, "bootstrap", liveRunnerSecret), "HeartbeatInterval": "200ms", "HeartbeatTTL": "30s", "ProxyURLTemplate": template, "RunnerGrants": []string{}, "HealthGrants": []string{}, "SessionProxyGrants": []string{}}
-		// Grants require exact host:port. Reserve a loopback range through configured
-		// test fixture URLs, which start before the orchestrator.
+		// Reserve loopback fixture addresses to grant exact ports, including
+		// runners that start after the orchestrator.
 		grants := fixtureGrants(t)
 		config["RunnerGrants"] = grants
 		config["HealthGrants"] = grants

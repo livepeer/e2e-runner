@@ -55,6 +55,7 @@ type testOrchestrator struct {
 	backend          string
 	process          *childProcess
 	httpBase         string
+	httpAddr         string
 	cliBase          string
 	proxyURLTemplate string
 	logPath          string
