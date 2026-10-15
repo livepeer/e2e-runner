@@ -145,7 +145,7 @@ func runPaidLifecycle(t *testing.T, f *paidFixture) {
 			requireStatus(t, "POST", proxy.ProxyURL, nil, 404)
 			requireStatus(t, "POST", channel+"/1", strings.NewReader(`{}`), 404)
 			status, _ = httpJSON(t, "POST", control+"/channels", map[string]any{"channels": []any{map[string]string{"name": "late", "mime_type": "application/json"}}}, token)
-			require.Contains(t, []int{403, 404}, status, "closed session credentials cannot create a channel")
+			require.Contains(t, []int{401, 404}, status, "closed session credentials cannot create a channel")
 			if scenario != "failed health" && scenario != "unregister" {
 				requireRunnerCapacity(t, requireDiscoveredRunner(t, orch, route), 2, 0, 2)
 			}

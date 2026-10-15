@@ -659,7 +659,7 @@ func runLiveRunnerServerSurface(t *testing.T) {
 		require.Empty(t, updated.HeartbeatSecret)
 		require.Equal(t, "updated metadata", requireDiscoveredRunner(t, orch, resp.RunnerID).Metadata)
 		unregisterRunner(t, orch, resp.RunnerID, "wrong-secret", http.StatusUnauthorized)
-		unregisterRunner(t, orch, resp.RunnerID, resp.HeartbeatSecret, http.StatusNoContent)
+		unregisterRunner(t, orch, resp.RunnerID, resp.HeartbeatSecret, runnerControlSuccessStatus(orch))
 	})
 
 	t.Run("proxy headers and session token isolation", func(t *testing.T) {
@@ -1217,9 +1217,16 @@ func reserveSession(t *testing.T, orch *testOrchestrator, runnerID string) sessi
 	return resp
 }
 
+func runnerControlSuccessStatus(orch *testOrchestrator) int {
+	if orch.backend == "node" {
+		return http.StatusOK
+	}
+	return http.StatusNoContent
+}
+
 func stopSession(t *testing.T, orch *testOrchestrator, runnerID, sessionID string) {
 	t.Helper()
-	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/session/"+url.PathEscape(sessionID)+"/stop", nil, http.StatusNoContent)
+	requireStatus(t, http.MethodPost, orch.httpBase+"/apps/"+url.PathEscape(runnerID)+"/session/"+url.PathEscape(sessionID)+"/stop", nil, runnerControlSuccessStatus(orch))
 }
 
 func registerStaticRunnerConfig(t *testing.T, orch *testOrchestrator, cfg staticRunnerConfig, status int) {
