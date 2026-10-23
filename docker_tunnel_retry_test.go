@@ -14,6 +14,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestFixtureProxyUsesUpstreamHost(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Upstream-Host", r.Host)
+		if r.Host == "control.trycloudflare.com" {
+			http.Error(w, "fixture endpoint inactive", 503)
+			return
+		}
+		_, _ = io.Copy(w, r.Body)
+	}))
+	defer upstream.Close()
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	proxy := httptest.NewServer(fixtureProxy(target))
+	defer proxy.Close()
+	const payload = `{"method":"eth_chainId"}`
+	req, err := http.NewRequest("POST", proxy.URL, strings.NewReader(payload))
+	require.NoError(t, err)
+	req.Host = "control.trycloudflare.com"
+	response, err := proxy.Client().Do(req)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, 200, response.StatusCode, string(body))
+	require.Equal(t, target.Host, response.Header.Get("X-Upstream-Host"))
+	require.Equal(t, payload, string(body))
+}
+
 func TestQuickTunnelRetryAfter(t *testing.T) {
 	received := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
 	const maxDelay time.Duration = 1<<63 - 1

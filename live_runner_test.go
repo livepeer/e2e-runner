@@ -1049,7 +1049,6 @@ func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cf
 		Mode:            cfg.mode,
 		Proxy:           cfg.proxy,
 		Capacity:        cfg.capacity,
-		Label:           cfg.label,
 		PriceInfo:       price,
 	})
 	require.NoError(t, err)

@@ -9,7 +9,7 @@ require (
 	github.com/gorilla/websocket v1.4.2
 	github.com/j0sh/minikafka v0.0.0-20260926062644-e1e6f1f8aae9
 	github.com/joho/godotenv v1.5.1
-	github.com/livepeer/golang-runner v0.0.0-20261014052742-af4bf0500a31
+	github.com/livepeer/golang-runner v0.0.0-20261023053117-5ba8d0942eb2
 	github.com/segmentio/kafka-go v0.4.47
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/protobuf v1.36.11

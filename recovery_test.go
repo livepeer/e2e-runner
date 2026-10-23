@@ -7,7 +7,6 @@ import (
 	"io"
 	"math/big"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -34,7 +33,7 @@ func faultRPC(t *testing.T, c *chainFixture) *rpcFaults {
 	t.Helper()
 	target, err := url.Parse(c.url)
 	require.NoError(t, err)
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy := fixtureProxy(target)
 	fault := &rpcFaults{}
 	srv := newFixtureServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fault.down.Load() {

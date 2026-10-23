@@ -1,33 +1,41 @@
 # Live Runner parity and payment E2E harness
 
-This repository runs real go-livepeer and Livepeer Node orchestrators, real Python/Go Live Runner registration clients, real payment signers, and Clearinghouse Batteries. It uses Live Runner application routes throughout.
+This repository tests Live Runner registration, application routes, payments, and Clearinghouse Batteries against go-livepeer and Livepeer Node. It runs the implementations as child processes or Docker containers, using the Python and Go runner SDKs and real payment signers.
 
 ## Running
 
-Copy `test.env` to the ignored `test.local.env`, set the source checkout paths and any chain settings needed by your selected suites, and select it with `E2E_ENV_FILE`. Resource locations have no machine-specific defaults.
+Copy [test.env](test.env) to the ignored `test.local.env`, set the source checkout paths and any chain settings needed by your selected suites, and select it with `E2E_ENV_FILE`. Resource locations have no machine-specific defaults. See [configuration and prerequisites](#configuration-and-prerequisites) before running the suites.
 
 ```sh
 cp test.env test.local.env
 # Edit test.local.env before running the suites.
 export E2E_ENV_FILE=test.local.env
 make test-offchain
-make test-onchain
-make test-accounting
-make test
 ```
 
-`test` includes all groups. An unavailable prerequisite fails its subtest with `INFRASTRUCTURE`; independent groups continue.
+Choose a target for the coverage you need:
+
+| Target | Coverage |
+|---|---|
+| `make test-offchain` | Runner registration, discovery, session controls, proxies, and media; no chain required |
+| `make test-onchain` | Payments, streaming uploads, protocol CLI, recovery, and oracle cases |
+| `make test-accounting` | Clearinghouse management, signing, accounting, and settlement; chain required except for management and Kafka proxy checks |
+| `make test` | All suites and command-package checks |
+
+Missing test prerequisites fail dependent tests with `INFRASTRUCTURE`; independent groups continue. On-chain coverage needs a disposable chain with the required capabilities, and runtime oracle coverage needs [compatible timeout settings](#oracle-timing).
 
 Direct runs load the same configuration:
 
 ```sh
-go test -count=1 -timeout 90m -v .
-go test -race -count=1 -timeout 90m -v .
-E2E_ORCHESTRATORS=node E2E_SIGNERS=node go test -count=1 -run '^TestOnchainPayments$' -v .
-E2E_ENV_FILE=test.local.env make test-onchain
+go test -count=1 -timeout 90m -v ./...
+go test -race -count=1 -timeout 90m -v ./...
+E2E_ORCHESTRATORS=node E2E_SIGNERS=node \
+  go test -count=1 -timeout 90m -run '^TestOnchainPayments$' -v .
 ```
 
-Run chain-changing suites serially; do not launch payment and accounting runs concurrently against the same chain. Go's slash-separated `-run` expressions can select a pairing, wallet mode, and case. For example, `-run '^TestOnchainPayments/go-livepeer/go-livepeer/split-wallet/challenge_and_admission$'`. Select the original wallet setup with `-run '^TestOnchainPayments/[^/]+/[^/]+/same-wallet$'`, or split wallets across all pairings with `-run '^TestOnchainPayments/[^/]+/[^/]+/split-wallet$'`.
+The Go runner SDK version is pinned in [go.mod](go.mod). The Python integration uses the checkout selected by `PYTHON_RUNNER_DIR`; streaming coverage requires `StreamPayload` and the `on_payment_session` callback. The harness records source revisions and working-tree fingerprints in its [run artifacts](#run-artifacts).
+
+Run chain-changing suites serially; do not launch payment and accounting suites concurrently against the same chain. Go's slash-separated `-run` expressions select an orchestrator, signer, wallet mode, and case. For example, `-run '^TestOnchainPayments/go-livepeer/go-livepeer/split-wallet/challenge_and_admission$'` selects one payment case. Use `-run '^TestOnchainPayments/[^/]+/[^/]+/same-wallet$'` or `-run '^TestOnchainPayments/[^/]+/[^/]+/split-wallet$'` to select a wallet mode across all pairings.
 
 ## Docker Compose mode
 
@@ -43,38 +51,42 @@ E2E_ENV_FILE=test.local.env make test-compose-gcp \
   E2E_COMPOSE_TEST_ARGS="-test.run=^TestClearinghouseManagement$"
 ```
 
-Each invocation snapshots the configured source working trees, builds Linux binaries and runner environments, and creates a unique Compose project with a fresh `livepeer/geth-with-livepeer-protocol:confluence` container. This is the devnet image used by go-livepeer's upstream e2e harness. The mode discovers its deployed Controller from `SetContractInfo` logs and reads its chain ID; it ignores externally configured RPC, Controller, feed, and funding credentials. Local process mode retains its existing external-chain configuration. `E2E_LPMS_DIR` supplies an optional local lpms replacement; a sibling checkout is detected automatically. Other relative module replacements must be made available explicitly before building.
+Each invocation snapshots the configured source working trees, builds Linux binaries and runner environments, and creates a unique Compose project with a fresh `livepeer/geth-with-livepeer-protocol:confluence` container. Compose requires all four source checkouts: go-livepeer, Node, Clearinghouse, and the Python runner, even when selecting a subset of tests. It discovers the deployed Controller from `SetContractInfo` logs and reads the chain ID, ignoring externally configured RPC, Controller, feed, and funding credentials. `E2E_LPMS_DIR` supplies an optional local lpms replacement; a sibling checkout is detected automatically. Other relative module replacements must be made available explicitly before building.
 
 The devnet must support `finalized` block tags, canonical Ethereum headers, and `evm_snapshot`/`evm_revert`/`evm_mine` for the corresponding redemption, listener, and recovery cases. The default image does not guarantee these capabilities; incompatible chains fail the dependent infrastructure prerequisites. `E2E_GETH_IMAGE` can select a compatible devnet image with the Livepeer protocol already deployed and unlocked disposable funding accounts. Compose creates fresh chain state for each invocation.
 
-Every fixture instance runs in a separate container using the appropriate Compose service: geth, clearinghouse, Node signer/orchestrator/chain CLI, go-livepeer signer/orchestrator/control CLI, Python and Go SDK runners, runner application adapters, and transport bridges. Services are created as tests need them, including fresh replicas and restart fixtures. Test callback state and assertions stay in the harness; each runner application adapter forwards requests through a TLS tunnel to that control plane. The Go SDK itself runs in its runner container, including registration, heartbeats, session controls, and unregister.
+Components run in separate containers, created as tests need them, including replicas and restart fixtures. Python and Go SDK runners execute inside their runner containers. Test callback state and assertions stay in the harness; runner application adapters forward requests through a TLS tunnel to it.
 
-The mode requires a Linux Docker host and Compose v2. Loopback origins use Linux host networking, with no application ports exposed on public VM interfaces. Component HTTP endpoints are advertised and consumed as HTTPS Quick Tunnel URLs. A gateway pool reuses public hostnames when fixtures stop or restart, and a shared TLS control tunnel isolates callback routes by random IDs. Tunnel provisioning retries HTTP 429 responses up to five attempts, waiting at least the `Retry-After` delay (seconds or HTTP date) when valid, with bounded exponential backoff as a minimum and as the fallback for absent or invalid headers. A loopback provisioning relay captures headers omitted by cloudflared while retaining verified HTTPS to the upstream API. Exhausted retries remain infrastructure failures. [Cloudflare HTTP 429 documentation](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-429/). Cloudflared connects to the edge over HTTP/2 TLS. Kafka uses a binary WebSocket bridge over WSS, retaining SCRAM authentication; metadata and coordinator replies advertise the bridge so producers cannot bypass it. The only plaintext transport segments are local origin/adapter connections. Certificate verification remains enabled. Quick Tunnels have a 200 in-flight request limit and do not support SSE; transport failures remain infrastructure failures. [Cloudflare Quick Tunnel documentation](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+The mode requires a Linux host with Docker, Compose v2, and Python 3. Loopback origins use Linux host networking, with no application ports exposed on public VM interfaces. Component HTTP endpoints use HTTPS Quick Tunnel URLs. A gateway pool reuses public hostnames between fixtures, and a shared TLS control tunnel isolates callback routes by random IDs. Tunnel provisioning makes up to five attempts for HTTP 429 responses, honoring valid `Retry-After` headers with exponential backoff as a minimum and fallback. Exhausted retries are infrastructure failures. Kafka uses a binary WebSocket bridge over WSS with SCRAM authentication. Plaintext transport is limited to local origin and adapter connections; certificate verification remains enabled for TLS connections.
+
+The tunnel path must support the HTTP behavior required by the selected tests, including streaming upload handshakes. See [Cloudflare's Quick Tunnel documentation](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/) for service limits.
 
 Quick Tunnels allocate one hostname per endpoint. Compose therefore exercises proxy URL templates using a final path placeholder (`https://…trycloudflare.com/e2e-proxy/{proxy}`). Local process mode exercises hostname templates.
 
-`compose-gcp` uses the active gcloud project by default, creates an Ubuntu VM with no service account, installs Docker, uploads source snapshots, runs Compose, collects logs/provenance, and deletes the VM and boot disk. It also configures automatic deletion after four hours. Set `E2E_GCP_PROJECT`, `E2E_GCP_ZONE` (default `us-west1-b`), or `E2E_GCP_MACHINE_TYPE` (default `e2-standard-8`) to override provisioning. Failures return a nonzero exit status. A deletion failure is reported with the exact VM identity. Cloud charges apply while the VM runs.
+`make test-compose-gcp` requires Python 3 and an authenticated `gcloud` CLI with Compute Engine access. It uses the active gcloud project by default, creates an Ubuntu VM with no service account, installs Docker, uploads source snapshots, runs Compose, collects logs and provenance, and deletes the VM and boot disk. It also configures automatic deletion after four hours. Set `E2E_GCP_PROJECT`, `E2E_GCP_ZONE` (default `us-west1-b`), or `E2E_GCP_MACHINE_TYPE` (default `e2-standard-8`) to override provisioning. Failures return a nonzero exit status. A deletion failure is reported with the exact VM identity. Cloud charges apply while the VM runs.
 
 Local Compose results live in `artifacts/e2e-*/artifacts`; GCP results are retained as `artifacts/e2e-compose-*/results.tar.gz`. Results include component/tunnel logs, `devnet.json`, endpoint mappings, source revisions/working changes, and binary hashes/build metadata. Temporary wallets and credential files are removed. Runtime images and external Go build/module cache volumes are reusable; chain state is never reused.
 
 ## Configuration and prerequisites
 
-`test.env` contains portable test defaults and comments for required resource settings. `godotenv.Load` fills only unset process variables. `E2E_ENV_FILE` selects another configuration file and a missing file is an error. Store environment-specific values in the ignored `test.local.env` or export them in the process environment. Do not store production credentials in configuration files.
+Local process mode requires Go compatible with [go.mod](go.mod) and the configured Node and Clearinghouse modules; `uv`; the Python runner's locked environment and media dependencies; and go-livepeer binaries built with Live Runner support, including `livepeer_cli`. Node's dispatcher, orchestrator, signer, and chain executables are built from the configured checkout unless prebuilt binaries are supplied. Compose builds these dependencies inside its runtime image.
+
+`test.env` contains portable test defaults and comments for required resource settings. Existing process variables take precedence over values loaded from the file. `E2E_ENV_FILE` selects another configuration file; a missing file is an error. Store environment-specific values in the ignored `test.local.env` or export them in the process environment. Use disposable credentials for these tests.
 
 | Setting | Purpose/default |
 |---|---|
-| `E2E_RPC_URL` | Required for on-chain suites: the disposable chain's RPC endpoint; the harness never switches chains automatically |
-| `E2E_ETH_CONTROLLER` | Required for on-chain suites: the Controller address deployed on that chain |
-| `E2E_EXPECTED_CHAIN_ID` | Required for on-chain suites: its decimal chain ID; mismatches fail before funding |
+| `E2E_RPC_URL` | Required for on-chain suites in local process mode: the disposable chain's RPC endpoint |
+| `E2E_ETH_CONTROLLER` | Required for on-chain suites in local process mode: the Controller address deployed on that chain |
+| `E2E_EXPECTED_CHAIN_ID` | Required for on-chain suites in local process mode: its decimal chain ID; mismatches fail before funding |
 | `E2E_ORCHESTRATORS`, `E2E_SIGNERS` | Comma-separated `go-livepeer,node`; defaults exercise both |
 | `GO_LIVEPEER_DIR`, `LIVEPEER_BINARY` | Explicit go-livepeer checkout path; use its `livepeer` binary or supply a binary path directly |
 | `E2E_GO_LIVEPEER_CLI_BINARY` | Actual interactive CLI; supply its path or use `livepeer_cli` in the configured `GO_LIVEPEER_DIR` |
 | `E2E_NODE_DIR`, `E2E_NODE_BINARY` | Explicit Node checkout path; build from it unless supplying a binary path |
 | `E2E_CLEARINGHOUSE_DIR`, `E2E_CLEARINGHOUSE_BINARY` | Explicit Clearinghouse checkout path; build from it unless supplying a binary path |
 | `PYTHON_RUNNER_DIR` | Explicit Python runner checkout path, required for Python SDK and media cases |
-| `E2E_GOLANG_RUNNER_DIR` | Optional Go runner checkout override for the Make launcher; otherwise use the module pinned in `go.mod` |
+| `E2E_GOLANG_RUNNER_DIR` | Optional Go runner checkout override for the Make launcher and Compose; otherwise use the module pinned in `go.mod` |
 | `E2E_GO_BINARY` | Toolchain used to build Node/clearinghouse and inspect build provenance; default `go` |
-| `E2E_FUNDER_ADDRESS`, `E2E_FUNDER_KEY_FILE`, `E2E_LPT_FUNDER_ADDRESS` | Unlocked disposable funding accounts or an owner-only private-key file; default selects available accounts |
+| `E2E_FUNDER_ADDRESS`, `E2E_FUNDER_KEY_FILE`, `E2E_LPT_FUNDER_ADDRESS` | Disposable funding accounts or an owner-only private-key file; by default, use the first RPC account for ETH and the account with the largest LPT balance for stake funding |
 | `E2E_ACCOUNT_ETH`, `E2E_PAYER_DEPOSIT_ETH`, `E2E_PAYER_RESERVE_ETH` | Fresh-account ETH and payer escrow amounts |
 | `E2E_REDEEMER_ETH` | ETH-only gas allowance for each fresh split-wallet hot account; default `0.01` ETH |
 | `E2E_BOND_LPT`, `E2E_BOND_MARGIN_LPT` | Minimum self-bond; when the pool is full, margin above its smallest stake |
@@ -86,6 +98,7 @@ Local Compose results live in `artifacts/e2e-*/artifacts`; GCP results are retai
 | `E2E_ORACLE_MAX_AGE` | Node's maximum oracle observation age |
 | `E2E_ORACLE_TEST_MAX_AGE` | Short age limit for independent oracle cache-expiry fixtures; default `45s` |
 | `E2E_ORACLE_POLL_INTERVAL` | Expected runtime polling interval of the tested builds; default `1h`. Set the oracle and suite timeouts to cover it |
+| `E2E_ORACLE_TIMEOUT` | Oracle assertion deadline; default `90s`. Runtime refresh cases require it to exceed the polling interval |
 | `E2E_SIGNER_MAX_HOURLY_USD`, `E2E_SIGNER_MAX_FIXED_USD`, `E2E_GO_SIGNER_MAX_PRICE_WEI` | Configured signer price ceilings |
 | `E2E_GO_BASE_PRICE_WEI` | go-livepeer's required base price; Live Runner prices are supplied separately |
 | `E2E_TICKET_FACE_VALUE`, `E2E_TICKET_WIN_PROB`, `E2E_TICKET_EV` | Node face/probability and go-livepeer ticket EV fixtures |
@@ -98,17 +111,19 @@ Local Compose results live in `artifacts/e2e-*/artifacts`; GCP results are retai
 
 Timeout settings in `test.env` cover HTTP, RPC, builds, readiness, transactions, activation, discovery, oracle refresh, live exhaustion, accounting, and redemption. They are Go duration strings. The Make launcher also loads configuration before resolving the Go SDK dependency, so `E2E_GOLANG_RUNNER_DIR` can select a checkout without editing `go.mod`. Direct `go test` uses the pinned Go runner module; use the Make launcher or an ignored Go workspace to test a source checkout.
 
-Requirements: Go and a toolchain compatible with the configured Node/clearinghouse modules; `uv`; the Python runner's locked environment and media dependencies; a go-livepeer binary built with Live Runner support and its `livepeer_cli`. Node's dispatcher, orchestrator, signer, and chain executables are built from the same configured checkout into a temporary directory. Fixtures use reserved loopback destinations for Node's runner, health, proxy, and discovery grants. Child processes receive isolated databases/configuration, and cleanup interrupts them before a bounded forced stop. Disposable keystores, passwords, webhook credentials, and authenticated Kafka credentials are generated in temporary directories with owner-only file permissions.
+Child processes receive isolated databases and configuration, and cleanup interrupts them before a bounded forced stop. Disposable keystores, passwords, webhook credentials, and Kafka credentials are generated in temporary directories with owner-only file permissions.
 
-The chain must already exist with the Livepeer protocol deployed. In local process mode, chain startup and protocol deployment are supplied externally; Compose mode provisions its own fresh devnet. Preflight verifies chain identity, deployed Controller, TicketBroker/BondingManager/RoundsManager/token resolution, canonical block-hash contract reads, ETH/LPT funding resources, and round activation. Accounts are created through `livepeer chain account create`. All ordinary paid suites and backend pairings explicitly share one registered recipient R per test run, initialized lazily by the first paid fixture. Its private temporary keystore/password directory survives fixture cleanup and is removed by `TestMain`; Compose places it in the shared run-root temporary mount. The cache is keyed by chain ID, genesis hash, and Controller, so fixture fault-proxy URLs retain the same recipient. Only the account is cached. Payers, escrow, feeds, signer state, jobs, orchestrator databases, and Clearinghouse databases remain fresh per fixture.
+### Chain requirements and fixture isolation
 
-R is funded, bonded, registered, and activated once, and published to the cache only after successful setup. Before reuse, the harness waits for outstanding R transactions, initializes the current round, and verifies activation and self-bonding. A displaced recipient receives only the additional stake required to reenter the pool. Fixture cleanup stops workers before the next fixture uses R; fresh secondary processes inherit wallet roles with separate databases, while restarts retain their configuration and database. CLI account-creation, faucet, registration, and staking tests keep independent accounts. Paid cases that deliberately change staking must request `paidSetupOptions{isolatedRecipient: true}`. Recovery snapshots occur after R setup, and activation is checked after rollback. Tests consume disposable-chain ETH/LPT and leave protocol transactions on that chain. The harness decrypts generated keystores to verify their reported addresses and sign deliberate protocol probes; externally supplied funding keys are imported separately.
+Local process mode requires an existing chain with the Livepeer protocol deployed; Compose provisions its own fresh devnet. Preflight verifies chain identity, Controller and protocol contract resolution, canonical block-hash contract reads, ETH/LPT funding resources, and round activation. Tests consume disposable-chain ETH/LPT and leave protocol transactions on that chain.
 
-Funding-account configuration does not refill LPT. Only setup operations needing stake call `ensureLPT`: the initial R bond, explicitly isolated recipients, or necessary additional stake after pool changes. When funding is short, the harness resolves the Controller's faucet, checks its balance and grant amount, and claims through the actual go-livepeer CLI. Funding uses fresh disposable wallets with one claim each and transfers each claim to the selected funder using the Node CLI. Temporary go-livepeer control nodes bind loopback and explicitly enable `-enableCliTxRoutes`. Both HTTP success and actual token balance changes are required. Claim count and time are bounded; faucet depletion or disabled automatic funding is an infrastructure failure. Ordinary paid fixtures therefore cost one initial bond and activation for the run, with no repeated full-bond refill.
+Ordinary paid fixtures share one registered recipient R within a harness invocation, keyed by chain ID, genesis hash, and Controller. R is funded, bonded, registered, and activated on first use, then checked for activation and self-bonding before reuse. Pool changes may require additional stake. Its temporary keystore survives fixture cleanup and is removed when the harness exits. Payers, escrow, feeds, signer state, jobs, and component databases are fresh per fixture; restart cases retain the state they exercise. CLI account-creation, faucet, registration, and staking tests use independent accounts, as do paid cases that deliberately change staking. Recovery snapshots occur after R setup, and activation is checked after rollback.
+
+LPT is replenished only when stake setup needs it. If funding is short and `E2E_AUTO_FAUCET` is enabled, the harness claims from the Controller's faucet through the go-livepeer CLI and transfers the tokens to the selected funder using the Node CLI. Claims use disposable wallets and must produce actual balance changes. Faucet depletion, exhausted claim/time limits, or insufficient funds with automatic funding disabled are infrastructure failures.
 
 Locally held protocol accounts use `livepeer chain` for transfers, bonding/approval, registration, round initialization, rewards and TicketBroker funding/unlock/cancel/withdrawal. Raw RPC is used for ETH funding and LPT transfers from accounts whose keys are held only by the RPC, test contract deployment/mutation, mining controls and intentionally invalid transactions. Configure `E2E_FUNDER_KEY_FILE` to use the Node CLI for funder LPT transfers too. CLI coverage compares account creation, encrypted keystores, overwrite protection, and resulting on-chain balances, stake, commission and service URI state. Faucet claims always use go-livepeer.
 
-Controlled expiry, snapshots, deterministic reorgs, and withdrawals require an externally provisioned disposable endpoint exposing `evm_snapshot`, `evm_revert`, and `evm_mine`. Ordinary redemption/restart/outage cases can wait for natural chain advancement within `E2E_BLOCK_TIMEOUT`; they do not require mining controls. Redemption confirmation for Node requires a real `finalized` block tag. Clearinghouse listener cases require standard Ethereum headers whose RLP hashes equal their reported block hashes. Oracle mutation cases require the harness-owned feed; an externally configured feed is not modified.
+Controlled expiry, snapshots, deterministic reorgs, and withdrawals require a disposable endpoint exposing `evm_snapshot`, `evm_revert`, and `evm_mine`. Ordinary redemption/restart/outage cases can wait for natural chain advancement within `E2E_BLOCK_TIMEOUT`; they do not require mining controls. Redemption confirmation for Node requires a real `finalized` block tag. Clearinghouse listener cases require standard Ethereum headers whose RLP hashes equal their reported block hashes. Oracle mutation cases require the harness-owned feed; an externally configured feed is not modified.
 
 ### RPC diagnosis
 
@@ -140,7 +155,22 @@ Payment, recovery, oracle, Clearinghouse signing, and Clearinghouse chain-recove
 
 In `same-wallet` mode, recipient and redeemer are the run-scoped R, retaining the default recipient configuration. In `split-wallet` mode, recipient is still R, while a fresh, distinct, inactive hot account H receives only `E2E_REDEEMER_ETH` for redemption gas and no LPT. Each split fixture's orchestrator processes load only H's keystore; Node receives R through `OrchestratorAddress`, and go-livepeer receives `-ethOrchAddr`. “Cold” is relative to that split fixture: earlier same-wallet use of R is intentional, and the harness retains R's key for setup. Secondary processes and restarts preserve these roles. Challenges, signed/persisted tickets, redemption events, and Clearinghouse attribution are checked against R; redemption transaction signers are checked against R in same-wallet mode and H in split-wallet mode.
 
-Successful jobs additionally cover Python/Go runner SDKs × persistent/single-shot × USD/hour or USD/fixed × proxy on/off: **128 combinations** across both wallet modes. The Python payment client performs the successful payment flow. Direct protocol requests create malformed or conflicting inputs. Both modes run serially and roughly double paid-suite runtime; use the existing suite timeout controls as needed. CLI, infrastructure, off-chain, and Clearinghouse management-only cases run independently of wallet mode.
+Successful-job coverage varies runner SDK (Python/Go), mode (persistent/single-shot), price unit (USD/hour or USD/fixed), and proxy setting across both wallet modes. The Python payment client performs the successful payment flow; direct protocol requests create malformed or conflicting inputs. Both wallet modes run serially. CLI, infrastructure, off-chain, and Clearinghouse management-only cases run independently of wallet mode.
+
+### Streaming uploads
+
+`TestOnchainStreamingUploads` covers paid single-shot uploads against Node with both signer implementations, wallet modes, runner SDKs, and proxy settings. It verifies the `Expect: 100-continue` payment handshake: unpaid challenges and rejected tickets must leave the input unread and send no `100 Continue`; accepted payments must permit continuation and deliver every byte, checked by size and SHA-256. Delayed collateral checks expose premature continuation by proxies. The Python client also exercises async iterators and seekable files starting at a nonzero position, using `StreamPayload(expect100=True, retry_buffer=False)`.
+
+Compose applies the same assertions through its HTTPS tunnels and fixture adapters. Every intermediary must preserve the `Expect` header and defer continuation until payment is accepted. go-livepeer orchestrators are skipped because they do not support this payment handshake.
+
+```sh
+E2E_ENV_FILE=test.local.env E2E_ORCHESTRATORS=node \
+  go test -count=1 -timeout 30m -run '^TestOnchainStreamingUploads$' -v .
+E2E_ENV_FILE=test.local.env make test-compose-gcp \
+  E2E_COMPOSE_TEST_ARGS='-test.run=^TestOnchainStreamingUploads/node/node/same-wallet$'
+```
+
+### Payment and recovery assertions
 
 | Group | Purpose and assertions |
 |---|---|
@@ -161,7 +191,9 @@ Successful jobs additionally cover Python/Go runner SDKs × persistent/single-sh
 
 Infrastructure checks report canonical-header, finality, and chain-control requirements separately. Recovery coverage includes expiry, redemption, pending restart, outage, failed transaction, fee cap, delayed finality and reorg scenarios per pairing. Cases needing chain controls fail before dependent setup if those controls are unavailable. Oracle coverage includes all four pairings using R, fresh funded payers and feeds, and isolated databases. Active-pool registration is required to obtain valid payment challenges, including for signing and discovery probes.
 
-Runtime oracle checks require `E2E_ORACLE_TIMEOUT` to exceed `E2E_ORACLE_POLL_INTERVAL`. Set the polling interval to match the tested builds. The default `90s` oracle budget is shorter than the default `1h` polling interval and therefore fails the runtime refresh prerequisite. Configure an oracle timeout above the poll interval, a suite timeout covering all selected pairings, and an observation age longer than the poll interval to exercise it. Restart checks verify that the same orchestrator/backend and signer key read the changed rate at startup.
+### Oracle timing
+
+Runtime oracle checks require `E2E_ORACLE_TIMEOUT` and `E2E_ORACLE_MAX_AGE` to exceed `E2E_ORACLE_POLL_INTERVAL`. Set the polling interval to match the tested builds; this setting describes their behavior and does not change their polling interval. The default `90s` oracle timeout is shorter than the default `1h` polling interval, so runtime refresh cases need a larger oracle timeout and a suite timeout covering all selected pairings. Restart checks verify that the same orchestrator/backend and signer key read the changed rate at startup.
 
 Invalid/stale observation cases allow the last valid cached rate to live until its age limit, then require pricing and signing to become unavailable. Node uses a short configurable age limit for these fixtures. go-livepeer exposes no equivalent maximum-observation-age setting; oracle-expiry coverage checks the same rejection behavior for both implementations.
 
@@ -185,7 +217,7 @@ The all-in-one `clearinghouse serve` fixture starts isolated SQLite storage, man
 
 Management and Kafka proxy checks need no chain. Signing and usage coverage includes all four pairings and can run independently of listener compatibility. Escrow, settlement attribution and listener recovery require a compatible controlled chain.
 
-go-livepeer usage charging, usage-based exhaustion and usage-to-settlement attribution use real signer events. Its in-memory producer queue has no durable outbox, so storage, capacity and restart/drain coverage applies to Node. The minikafka dependency requires Go 1.27.1 or newer.
+go-livepeer usage charging, usage-based exhaustion and usage-to-settlement attribution use real signer events. Its in-memory producer queue has no durable outbox, so storage, capacity and restart/drain coverage applies to Node.
 
 ## Run artifacts
 

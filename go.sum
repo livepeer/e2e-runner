@@ -80,8 +80,8 @@ github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
 github.com/leanovate/gopter v0.2.11 h1:vRjThO1EKPb/1NsDXuDrzldR28RLkBflWYcU9CvzWu4=
 github.com/leanovate/gopter v0.2.11/go.mod h1:aK3tzZP/C+p1m3SPRE4SYZFGP7jjkuSI4f7Xvpt0S9c=
-github.com/livepeer/golang-runner v0.0.0-20261014052742-af4bf0500a31 h1:lj91a6lepiUzo+KqTBYwczAF1OT/IG09+RTOCoYfD10=
-github.com/livepeer/golang-runner v0.0.0-20261014052742-af4bf0500a31/go.mod h1:7Eao2+wi/GhTZbCFspOShfFe69DLWv1CabfUCqQaTgc=
+github.com/livepeer/golang-runner v0.0.0-20261023053117-5ba8d0942eb2 h1:mkKiph+LaKG7gI3aDXY65SeG00swtVoRhXXnh4mzQvQ=
+github.com/livepeer/golang-runner v0.0.0-20261023053117-5ba8d0942eb2/go.mod h1:7Eao2+wi/GhTZbCFspOShfFe69DLWv1CabfUCqQaTgc=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/mattn/go-sqlite3 v1.14.18 h1:JL0eqdCOq6DJVNPSvArO/bIV9/P7fbGrV00LZHc+5aI=

@@ -90,7 +90,7 @@ func startContainerGoRunner(t *testing.T, ctx context.Context, orch *testOrchest
 	require.NoError(t, err)
 	// Options also contains callbacks and an HTTP client. Serialize only the
 	// wire-safe registration fields; callbacks remain inside the SDK container.
-	options := map[string]any{"OrchestratorURL": orch.httpBase, "BootstrapSecret": liveRunnerSecret, "RunnerURL": cfg.runnerURL, "App": liveRunnerApp, "Metadata": cfg.metadata, "Mode": cfg.mode, "Proxy": cfg.proxy, "Capacity": cfg.capacity, "Label": cfg.label, "PriceInfo": price}
+	options := map[string]any{"OrchestratorURL": orch.httpBase, "BootstrapSecret": liveRunnerSecret, "RunnerURL": cfg.runnerURL, "App": liveRunnerApp, "Metadata": cfg.metadata, "Mode": cfg.mode, "Proxy": cfg.proxy, "Capacity": cfg.capacity, "PriceInfo": price}
 	data, err := json.Marshal(map[string]any{"Listen": addr, "Token": token, "Options": options})
 	require.NoError(t, err)
 	dir := t.TempDir()

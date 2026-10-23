@@ -411,6 +411,14 @@ func recordEndpoint(t *testing.T, origin, endpoint string) {
 	require.NoError(t, f.Close())
 }
 
+func fixtureProxy(target *url.URL) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{Rewrite: func(r *httputil.ProxyRequest) {
+		// RPC and signer hops must use their upstream's Host. Keeping the
+		// control tunnel's Host would route back to its gateway at the edge.
+		r.SetURL(target)
+	}}
+}
+
 func initializeCompose() (func(), error) {
 	if !composeMode() {
 		return func() {}, nil

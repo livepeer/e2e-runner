@@ -2,15 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +25,80 @@ import (
 	"github.com/segmentio/kafka-go/protocol/metadata"
 	"github.com/stretchr/testify/require"
 )
+
+func TestHTTPProxiesWaitForUploadPermission(t *testing.T) {
+	for _, mode := range []string{"gateway", "proxy"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, status := range []int{402, 403, 200} {
+				t.Run(fmt.Sprint(status), func(t *testing.T) {
+					var validated, consumed, early atomic.Bool
+					origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						time.Sleep(1500 * time.Millisecond)
+						validated.Store(true)
+						if status != 200 {
+							w.WriteHeader(status)
+							return
+						}
+						_, _ = io.Copy(w, r.Body)
+					}))
+					defer origin.Close()
+					target, err := url.Parse(origin.URL)
+					require.NoError(t, err)
+					var handler http.Handler = httpProxy(target)
+					if mode == "gateway" {
+						file := filepath.Join(t.TempDir(), "target")
+						require.NoError(t, os.WriteFile(file, []byte(origin.URL), 0600))
+						handler = gatewayHandler(file)
+					}
+					server := httptest.NewServer(handler)
+					defer server.Close()
+					var interim []int
+					trace := &httptrace.ClientTrace{Got1xxResponse: func(code int, _ textproto.MIMEHeader) error {
+						interim = append(interim, code)
+						if !validated.Load() {
+							early.Store(true)
+						}
+						return nil
+					}}
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					source := uploadReader{Reader: strings.NewReader("upload"), consumed: &consumed}
+					req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), "POST", server.URL, source)
+					require.NoError(t, err)
+					req.Header.Set("Expect", "100-continue")
+					transport := http.DefaultTransport.(*http.Transport).Clone()
+					transport.ExpectContinueTimeout = time.Duration(1<<63 - 1)
+					defer transport.CloseIdleConnections()
+					response, err := (&http.Client{Transport: transport}).Do(req)
+					require.NoError(t, err)
+					defer response.Body.Close()
+					body, err := io.ReadAll(response.Body)
+					require.NoError(t, err)
+					require.Equal(t, status, response.StatusCode)
+					require.False(t, early.Load(), "proxy sent an interim response before validation")
+					if status == 200 {
+						require.Equal(t, []int{100}, interim)
+						require.Equal(t, "upload", string(body))
+						require.True(t, consumed.Load())
+					} else {
+						require.Empty(t, interim)
+						require.False(t, consumed.Load())
+					}
+				})
+			}
+		})
+	}
+}
+
+type uploadReader struct {
+	io.Reader
+	consumed *atomic.Bool
+}
+
+func (r uploadReader) Read(p []byte) (int, error) {
+	r.consumed.Store(true)
+	return r.Reader.Read(p)
+}
 
 func TestKafkaDiscoveryUsesBridge(t *testing.T) {
 	for _, test := range []struct {

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/segmentio/kafka-go/protocol"
@@ -157,6 +158,21 @@ func kafkaRelay(tcp net.Conn, ws *websocket.Conn, address string) {
 	<-done
 }
 
+var proxyTransport = func() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Never consume an inbound Expect body just because the transport's usual
+	// one-second timer elapsed. Only the upstream may permit the upload. The
+	// incoming request context still cancels a disconnected or timed-out client.
+	transport.ExpectContinueTimeout = time.Duration(1<<63 - 1)
+	return transport
+}()
+
+func httpProxy(target *url.URL) *httputil.ReverseProxy {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = proxyTransport
+	return proxy
+}
+
 func gatewayHandler(targetFile string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		data, err := os.ReadFile(targetFile)
@@ -182,7 +198,7 @@ func gatewayHandler(targetFile string) http.Handler {
 			http.Error(w, "fixture endpoint inactive", http.StatusServiceUnavailable)
 			return
 		}
-		proxy := httputil.NewSingleHostReverseProxy(u)
+		proxy := httpProxy(u)
 		// Preserve the public Host for native proxy-template matching.
 		proxy.FlushInterval = -1
 		proxy.ServeHTTP(w, r)
@@ -273,7 +289,7 @@ func main() {
 		if err != nil || u.Scheme != "https" {
 			log.Fatal("proxy target must use HTTPS")
 		}
-		proxy := httputil.NewSingleHostReverseProxy(u)
+		proxy := httpProxy(u)
 		original := proxy.Director
 		proxy.Director = func(r *http.Request) { original(r); r.Host = u.Host }
 		log.Fatal(http.ListenAndServe(*listen, proxy))

@@ -13,11 +13,9 @@ async def main():
             runner_url=sys.argv[3],
             app=sys.argv[4],
             mode=sys.argv[5],
-            label=sys.argv[6],
             capacity=1,
             price=0,
             auto_detect_gpu=False,
-            heartbeat_interval_s=60,
         )
     except LivepeerGatewayError as exc:
         msg = str(exc)
