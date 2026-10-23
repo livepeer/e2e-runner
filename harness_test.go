@@ -308,7 +308,7 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 		require.NoError(t, err)
 		template = strings.ReplaceAll(template, "{http_port}", port)
 	}
-	orch := &testOrchestrator{backend: backend, httpBase: base, httpAddr: httpAddr, cliBase: publicURL(t, "http://"+cliAddr), proxyURLTemplate: template}
+	orch := &testOrchestrator{backend: backend, httpBase: base, httpAddr: httpAddr, cliBase: base, proxyURLTemplate: template}
 	var args []string
 	var dir string
 	stateDir := opts.dir
@@ -317,11 +317,7 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 	}
 	opts.dir = stateDir
 	if backend == "node" {
-		dir = opts.dir
-		if dir == "" {
-			dir = t.TempDir()
-		}
-		orch.cliBase = base
+		dir = stateDir
 		config := map[string]any{"Listen": httpAddr, "MetricsListen": cliAddr, "ServiceURL": base, "BootstrapSecretFile": secretFile(t, dir, "bootstrap", liveRunnerSecret), "HeartbeatInterval": "200ms", "HeartbeatTTL": "30s", "ProxyURLTemplate": template, "RunnerGrants": []string{}, "HealthGrants": []string{}, "SessionProxyGrants": []string{}}
 		// Reserve loopback fixture addresses to grant exact ports, including
 		// runners that start after the orchestrator.
@@ -365,6 +361,7 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 		args = []string{"orchestrator", "--config", writeTOML(t, filepath.Join(dir, "orchestrator.toml"), config)}
 	} else {
 		dir = stateDir
+		orch.cliBase = publicURL(t, "http://"+cliAddr)
 		args = []string{"-orchestrator", "-useLiveRunners", "-orchSecret", liveRunnerSecret, "-serviceAddr", base, "-httpAddr", "http://" + httpAddr, "-cliAddr", cliAddr, "-rtmpAddr", freeAddr(t), "-datadir", filepath.Join(opts.dir, "data"), "-startupAvailabilityCheck=false"}
 		if opts.account == nil {
 			args = append(args, "-network", "offchain")

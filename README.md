@@ -51,21 +51,17 @@ E2E_ENV_FILE=test.local.env make test-compose-gcp \
   E2E_COMPOSE_TEST_ARGS="-test.run=^TestClearinghouseManagement$"
 ```
 
-Each invocation snapshots the configured source working trees, builds Linux binaries and runner environments, and creates a unique Compose project with a fresh `livepeer/geth-with-livepeer-protocol:confluence` container. Compose requires all four source checkouts: go-livepeer, Node, Clearinghouse, and the Python runner, even when selecting a subset of tests. It discovers the deployed Controller from `SetContractInfo` logs and reads the chain ID, ignoring externally configured RPC, Controller, feed, and funding credentials. `E2E_LPMS_DIR` supplies an optional local lpms replacement; a sibling checkout is detected automatically. Other relative module replacements must be made available explicitly before building.
+Compose requires a Linux host with Docker, Compose v2, Python 3, and all four source checkouts, including when selecting a subset of tests. It snapshots their working trees, builds the binaries and Python environment, and starts a fresh `livepeer/geth-with-livepeer-protocol:confluence` devnet. Controller and chain ID are discovered from that chain; external RPC, feed, Controller, and funding settings are ignored. `E2E_LPMS_DIR` supplies an optional local lpms replacement; a sibling checkout is detected automatically. Other local module replacements must be supplied explicitly.
 
-The devnet must support `finalized` block tags, canonical Ethereum headers, and `evm_snapshot`/`evm_revert`/`evm_mine` for the corresponding redemption, listener, and recovery cases. The default image does not guarantee these capabilities; incompatible chains fail the dependent infrastructure prerequisites. `E2E_GETH_IMAGE` can select a compatible devnet image with the Livepeer protocol already deployed and unlocked disposable funding accounts. Compose creates fresh chain state for each invocation.
+Components and SDK runners execute in separate containers. Callback assertions remain in the harness behind TLS adapters. HTTPS Quick Tunnels advertise component endpoints; gateways reuse hostnames between fixtures. Provisioning retries HTTP 429 up to five attempts, honoring valid `Retry-After` headers with exponential backoff as the minimum and fallback. Kafka uses a WSS bridge with SCRAM authentication. Only local origin/adapter connections use plaintext. TLS verification stays enabled and application ports remain private to loopback.
 
-Components run in separate containers, created as tests need them, including replicas and restart fixtures. Python and Go SDK runners execute inside their runner containers. Test callback state and assertions stay in the harness; runner application adapters forward requests through a TLS tunnel to it.
+Quick Tunnels use one hostname per endpoint, so Compose tests path templates (`https://…trycloudflare.com/e2e-proxy/{proxy}`); local mode tests hostname templates. The tunnel must preserve the selected tests' HTTP semantics. Current streaming validation exposes premature Cloudflare `100 Continue`; the upload assertions remain enabled. See [Quick Tunnel limits](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
 
-The mode requires a Linux host with Docker, Compose v2, and Python 3. Loopback origins use Linux host networking, with no application ports exposed on public VM interfaces. Component HTTP endpoints use HTTPS Quick Tunnel URLs. A gateway pool reuses public hostnames between fixtures, and a shared TLS control tunnel isolates callback routes by random IDs. Tunnel provisioning makes up to five attempts for HTTP 429 responses, honoring valid `Retry-After` headers with exponential backoff as a minimum and fallback. Exhausted retries are infrastructure failures. Kafka uses a binary WebSocket bridge over WSS with SCRAM authentication. Plaintext transport is limited to local origin and adapter connections; certificate verification remains enabled for TLS connections.
+The default devnet does not guarantee finalized tags, canonical Ethereum headers, or mining/snapshot controls. Select a compatible protocol-deployed chain with `E2E_GETH_IMAGE` for the dependent suites; missing capabilities fail infrastructure prerequisites.
 
-The tunnel path must support the HTTP behavior required by the selected tests, including streaming upload handshakes. See [Cloudflare's Quick Tunnel documentation](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/) for service limits.
+`make test-compose-gcp` additionally requires an authenticated `gcloud` CLI with Compute Engine access. It creates an Ubuntu VM without a service account, installs Docker, runs Compose, collects results, and deletes the VM and boot disk. The VM also has a four-hour automatic deletion deadline. Override `E2E_GCP_PROJECT`, `E2E_GCP_ZONE` (default `us-west1-b`), and `E2E_GCP_MACHINE_TYPE` (default `e2-standard-8`) as needed. Failures return a nonzero status; failed deletion reports the VM identity. Cloud charges apply while it runs.
 
-Quick Tunnels allocate one hostname per endpoint. Compose therefore exercises proxy URL templates using a final path placeholder (`https://…trycloudflare.com/e2e-proxy/{proxy}`). Local process mode exercises hostname templates.
-
-`make test-compose-gcp` requires Python 3 and an authenticated `gcloud` CLI with Compute Engine access. It uses the active gcloud project by default, creates an Ubuntu VM with no service account, installs Docker, uploads source snapshots, runs Compose, collects logs and provenance, and deletes the VM and boot disk. It also configures automatic deletion after four hours. Set `E2E_GCP_PROJECT`, `E2E_GCP_ZONE` (default `us-west1-b`), or `E2E_GCP_MACHINE_TYPE` (default `e2-standard-8`) to override provisioning. Failures return a nonzero exit status. A deletion failure is reported with the exact VM identity. Cloud charges apply while the VM runs.
-
-Local Compose results live in `artifacts/e2e-*/artifacts`; GCP results are retained as `artifacts/e2e-compose-*/results.tar.gz`. Results include component/tunnel logs, `devnet.json`, endpoint mappings, source revisions/working changes, and binary hashes/build metadata. Temporary wallets and credential files are removed. Runtime images and external Go build/module cache volumes are reusable; chain state is never reused.
+Local results are in `artifacts/e2e-*/artifacts`; GCP results are in `artifacts/e2e-compose-*/results.tar.gz`. They include component/tunnel logs, devnet identity, endpoint mappings, source provenance, and binary metadata. Temporary wallets and credentials are removed; build/module caches and runtime images are reusable, while chain state is fresh.
 
 ## Configuration and prerequisites
 
@@ -109,21 +105,17 @@ Local process mode requires Go compatible with [go.mod](go.mod) and the configur
 | `E2E_BOOTSTRAP_SECRET_FILE` | Optional owner-only bootstrap credential file; otherwise generate a disposable secret |
 | `E2E_ARTIFACT_DIR` | Child logs and binary/source provenance; default `artifacts` |
 
-Timeout settings in `test.env` cover HTTP, RPC, builds, readiness, transactions, activation, discovery, oracle refresh, live exhaustion, accounting, and redemption. They are Go duration strings. The Make launcher also loads configuration before resolving the Go SDK dependency, so `E2E_GOLANG_RUNNER_DIR` can select a checkout without editing `go.mod`. Direct `go test` uses the pinned Go runner module; use the Make launcher or an ignored Go workspace to test a source checkout.
-
-Child processes receive isolated databases and configuration, and cleanup interrupts them before a bounded forced stop. Disposable keystores, passwords, webhook credentials, and Kafka credentials are generated in temporary directories with owner-only file permissions.
+Defaults and timeout settings live in [test.env](test.env); durations use Go syntax. The Make launcher loads configuration before resolving dependencies, allowing `E2E_GOLANG_RUNNER_DIR` to select a checkout. Direct `go test` uses the pinned SDK unless an ignored Go workspace overrides it. Each child receives isolated configuration/databases and disposable, owner-only credential files; cleanup interrupts processes before a bounded forced stop.
 
 ### Chain requirements and fixture isolation
 
-Local process mode requires an existing chain with the Livepeer protocol deployed; Compose provisions its own fresh devnet. Preflight verifies chain identity, Controller and protocol contract resolution, canonical block-hash contract reads, ETH/LPT funding resources, and round activation. Tests consume disposable-chain ETH/LPT and leave protocol transactions on that chain.
+Local mode requires a disposable chain with the Livepeer protocol deployed. Preflight checks identity, contract resolution, canonical contract reads, and funding/activation prerequisites. Run chain-changing suites serially: tests consume funds and leave protocol transactions.
 
-Ordinary paid fixtures share one registered recipient R within a harness invocation, keyed by chain ID, genesis hash, and Controller. R is funded, bonded, registered, and activated on first use, then checked for activation and self-bonding before reuse. Pool changes may require additional stake. Its temporary keystore survives fixture cleanup and is removed when the harness exits. Payers, escrow, feeds, signer state, jobs, and component databases are fresh per fixture; restart cases retain the state they exercise. CLI account-creation, faucet, registration, and staking tests use independent accounts, as do paid cases that deliberately change staking. Recovery snapshots occur after R setup, and activation is checked after rollback.
+Paid fixtures share one registered recipient per chain within the run, checking activation and self-bonding before reuse. Payers, escrow, feeds, jobs, signer state, and databases remain fresh. Restarts preserve the state under test. CLI and staking cases use independent accounts; paid cases changing stake must request `isolatedRecipient`. Recipient keys survive fixture cleanup and are removed at harness exit. Recovery snapshots follow recipient setup.
 
-LPT is replenished only when stake setup needs it. If funding is short and `E2E_AUTO_FAUCET` is enabled, the harness claims from the Controller's faucet through the go-livepeer CLI and transfers the tokens to the selected funder using the Node CLI. Claims use disposable wallets and must produce actual balance changes. Faucet depletion, exhausted claim/time limits, or insufficient funds with automatic funding disabled are infrastructure failures.
+Stake setup replenishes LPT only when needed. With `E2E_AUTO_FAUCET` enabled, the harness claims through go-livepeer's CLI using disposable wallets, checks actual balance changes, and transfers tokens to the funder with the Node CLI. Depletion or exhausted time/claim limits fail infrastructure prerequisites. Locally held accounts use `livepeer chain` for protocol transactions; RPC handles unlocked-account funding, test contracts, mining controls, and deliberate invalid transactions. `E2E_FUNDER_KEY_FILE` enables CLI signing for funder LPT transfers.
 
-Locally held protocol accounts use `livepeer chain` for transfers, bonding/approval, registration, round initialization, rewards and TicketBroker funding/unlock/cancel/withdrawal. Raw RPC is used for ETH funding and LPT transfers from accounts whose keys are held only by the RPC, test contract deployment/mutation, mining controls and intentionally invalid transactions. Configure `E2E_FUNDER_KEY_FILE` to use the Node CLI for funder LPT transfers too. CLI coverage compares account creation, encrypted keystores, overwrite protection, and resulting on-chain balances, stake, commission and service URI state. Faucet claims always use go-livepeer.
-
-Controlled expiry, snapshots, deterministic reorgs, and withdrawals require a disposable endpoint exposing `evm_snapshot`, `evm_revert`, and `evm_mine`. Ordinary redemption/restart/outage cases can wait for natural chain advancement within `E2E_BLOCK_TIMEOUT`; they do not require mining controls. Redemption confirmation for Node requires a real `finalized` block tag. Clearinghouse listener cases require standard Ethereum headers whose RLP hashes equal their reported block hashes. Oracle mutation cases require the harness-owned feed; an externally configured feed is not modified.
+Expiry, reorg, and withdrawal cases require `evm_snapshot`, `evm_revert`, and `evm_mine`. Ordinary redemption/restart/outage cases can wait for natural advancement within `E2E_BLOCK_TIMEOUT`. Ticket values must cover redemption gas at the selected chain's gas price. Node redemption requires real `finalized` tags. Clearinghouse listeners require Ethereum headers whose RLP hashes match their reported hashes. Oracle mutation requires the harness-owned feed; external feeds are never modified.
 
 ### RPC diagnosis
 
@@ -138,24 +130,16 @@ Compare the hexadecimal response with the decimal `E2E_EXPECTED_CHAIN_ID` you co
 
 ## Off-chain parity coverage
 
-Off-chain scenarios run against both implementations: Python/Go dynamic registration; persistent/single-shot modes; proxy on/off; metadata and capacity discovery; busy/release/unregister behavior; bootstrap and heartbeat authorization; per-session token isolation; channels and public proxy creation/deletion/forwarding; domain proxy templates; startup static registration; runtime CLI registration; failed static health; session-control APIs; and Python media with two video and two audio tracks, verifying decoded colors/frequencies and segment statistics.
-
-Startup static fixtures translate to go-livepeer JSON or Node TOML. Runtime CLI registration is tested separately from startup registration. Rejection checks compare status and behavior, without requiring identical error text.
+Both orchestrators exercise Python/Go registration, discovery and capacity, authorization and session isolation, persistent/single-shot lifecycles, proxy routing, static startup/runtime registration, and health failures. Media tests decode two video and two audio tracks and verify their colors, frequencies, sample/frame counts, and segment statistics. Python owns media verification and exits unsuccessfully on failure.
 
 ## On-chain cases
 
-Payment, recovery, oracle, Clearinghouse signing, and Clearinghouse chain-recovery coverage run the four pairings below in both `same-wallet` and `split-wallet` modes. Every job uses one signer implementation and key for its entire lifetime, including replica and restart scenarios. Attempts to use a different key exercise isolation checks.
+Paid payment, recovery, oracle, signing, and settlement tests exercise go-livepeer/Node orchestrators crossed with go-livepeer/Node signers in both wallet modes. Each job keeps one signer backend and key throughout replicas and restarts.
 
-| Orchestrator | Signer |
-|---|---|
-| go-livepeer | go-livepeer |
-| go-livepeer | Node |
-| Node | go-livepeer |
-| Node | Node |
+- `same-wallet`: the registered recipient also pays redemption gas.
+- `split-wallet`: a fresh inactive redeemer receives only `E2E_REDEEMER_ETH`, no LPT. Orchestrators load its key and receive the recipient through Node's `OrchestratorAddress` or go-livepeer's `-ethOrchAddr`. Tickets and attribution identify the recipient; redemption transactions identify the redeemer.
 
-In `same-wallet` mode, recipient and redeemer are the run-scoped R, retaining the default recipient configuration. In `split-wallet` mode, recipient is still R, while a fresh, distinct, inactive hot account H receives only `E2E_REDEEMER_ETH` for redemption gas and no LPT. Each split fixture's orchestrator processes load only H's keystore; Node receives R through `OrchestratorAddress`, and go-livepeer receives `-ethOrchAddr`. “Cold” is relative to that split fixture: earlier same-wallet use of R is intentional, and the harness retains R's key for setup. Secondary processes and restarts preserve these roles. Challenges, signed/persisted tickets, redemption events, and Clearinghouse attribution are checked against R; redemption transaction signers are checked against R in same-wallet mode and H in split-wallet mode.
-
-Successful-job coverage varies runner SDK (Python/Go), mode (persistent/single-shot), price unit (USD/hour or USD/fixed), and proxy setting across both wallet modes. The Python payment client performs the successful payment flow; direct protocol requests create malformed or conflicting inputs. Both wallet modes run serially. CLI, infrastructure, off-chain, and Clearinghouse management-only cases run independently of wallet mode.
+The successful-job matrix also varies Python/Go runner SDK, persistent/single-shot mode, USD fixed/hourly price, and proxy setting: 128 combinations. Python performs successful payment flows; direct protocol requests supply invalid/conflicting inputs. CLI, infrastructure, off-chain, management-only, and listener-only tests run outside the wallet matrix.
 
 ### Streaming uploads
 
@@ -172,24 +156,16 @@ E2E_ENV_FILE=test.local.env make test-compose-gcp \
 
 ### Payment and recovery assertions
 
-| Group | Purpose and assertions |
+| Group | Checks |
 |---|---|
-| Identity and discovery | Recover the signer identity; check challenge and signed-ticket recipients, application/GPU filters, normalized wei prices, and capacity. Node advertises the ticket recipient; go-livepeer advertises its service signing account, which is the hot address in split mode. Each backend's identity signature format is verified explicitly. |
-| Dynamic and static prices | Valid fixed/hourly startup and runtime registrations; reject missing, empty, zero, negative, malformed, unsupported-currency and unsupported-unit prices at initial registration, heartbeat update, startup and runtime CLI registration. Invalid updates must retain the current runner price. |
-| Zero-price/session regression | Paid sessions retain agreed prices after rejected missing/zero updates and valid repricing; new sessions use updated prices. |
-| Challenge/admission | Unpaid reservation returns parameters without forwarding work or consuming a slot; valid payment forwards the response and reserves capacity; stop releases it. |
-| Fixed/live credit | Fixed per-request charging; fixed-session follow-up rejection; initial live credit, replenishment, duplicate recipient submission rejection, bounded exhaustion, capacity release and no-ticket-needed responses. |
-| Ceilings/conversion | Below/equal/above request, webhook, and configured limits; exact conversion; one-ticket rounding. Changed/invalid/stale oracle observations exercise repricing or rejection. |
-| Signed state | Sequence advancement, unchanged identity, tampering, app/type/manifest binding, invalid credentials, and separate replica/restart continuation on the same signer implementation/key. |
-| Ticket validation | Invalid recipient, face value, probability, random hash, expiry, payer, signature, nonce, expected price, missing tickets, duplicate tickets, batch-count/exposure boundaries and refresh thresholds. |
-| Replay/concurrency | One admission for concurrently replayed credentials; independent paid jobs cannot exceed available slots. Signer HTTP retries are not assumed idempotent. |
-| Refresh | Valid admitted-session refresh, wrong sender rejection, nonce threshold, expiration, preserved session identity and new payment parameters. |
-| Funding | Missing/insufficient deposit or claimable reserve, impending withdrawal, recovery after funding/cancel-unlock, and concurrent accounting liabilities. |
-| Authorization | Approve/reject; unavailable/malformed webhook; cached and per-request decisions; changed authorization identity; price limits; rejection returns no usable payment credentials. |
-| Media/lifecycle | Paid multitrack media and cleanup, stop/unregister, live exhaustion, channels/proxies, cancellation, failed health and shutdown. |
-| Redemption/recovery | Observe actual winning tickets using bounded generation; wait beyond acceptance expiry; check persisted recipient, transaction gas payer, TicketBroker event payer/recipient, and escrow debit; reject duplicate/invalid redemption using the hot account after stopping its worker; pending restart, RPC interruption, fee limits, delayed confirmation and reorg recovery. Node confirms through `finalized`; go-livepeer uses mined receipts. |
+| Registration and prices | Identity, filtering, normalized prices, valid/invalid dynamic and static registration, preserved agreed session prices |
+| Admission and credit | Unpaid challenges, paid forwarding, capacity, fixed/live charging, replenishment, rounding, ceilings, and exhaustion |
+| Credentials and concurrency | State binding/tampering, ticket policy and batch limits, refresh, signer continuity, replay, and independent concurrent jobs |
+| Funding and authorization | Deposit/reserve/withdrawal limits, funding recovery, webhook decisions/cache/identity, and unusable credentials on rejection |
+| Lifecycle and media | Channels/proxies, stop/unregister, health, cancellation, shutdown, and decoded multitrack media |
+| Redemption | Persisted winners, recipient/payer/gas identities, expiry, escrow debit, invalid signatures before redemption, successful recovery, duplicate rejection, restarts, outages, fee caps, finality, and reorgs |
 
-Infrastructure checks report canonical-header, finality, and chain-control requirements separately. Recovery coverage includes expiry, redemption, pending restart, outage, failed transaction, fee cap, delayed finality and reorg scenarios per pairing. Cases needing chain controls fail before dependent setup if those controls are unavailable. Oracle coverage includes all four pairings using R, fresh funded payers and feeds, and isolated databases. Active-pool registration is required to obtain valid payment challenges, including for signing and discovery probes.
+Infrastructure checks report canonical-header, finality, and chain-control requirements separately. Missing prerequisites fail dependent cases before their behavior can be validated.
 
 ### Oracle timing
 
@@ -199,28 +175,16 @@ Invalid/stale observation cases allow the last valid cached rate to live until i
 
 ## Clearinghouse Batteries cases
 
-The all-in-one `clearinghouse serve` fixture starts isolated SQLite storage, management API, signing-authorization webhook, and an on-chain listener using the TicketBroker address resolved from the Controller. Both signer fixtures enable authenticated loopback Kafka and accounting. go-livepeer connects anonymously to the harness's minikafka-derived `e2e-kafka-proxy`, which forwards record keys, payloads, timestamps and headers to Clearinghouse using its SCRAM producer credentials. The proxy acknowledges Produce only after upstream acceptance and restricts forwarding to the configured single-partition topic. In Compose mode it runs in the `kafka-proxy` service and uses the Kafka transport bridges.
+`clearinghouse serve` runs isolated SQLite storage, management, authorization, accounting, and an optional chain listener. Both signers emit real usage. The anonymous go-livepeer producer uses `e2e-kafka-proxy`, which preserves records and acknowledges only upstream acceptance with Clearinghouse's SCRAM credentials. Compose also uses the WSS bridges.
 
-| Group | Purpose and assertions |
-|---|---|
-| Budgets/keys | ETH/USD grant and allocation creation/funding, API keys, exact balances, revocation refunds, allocation isolation, usage and ledger reporting. |
-| Service permissions | Missing/wrong tokens, wrong roles, insufficient management permissions, authorized operations. |
-| Signing authorization, both signers | Valid/malformed/revoked keys, paused/inactive grants or allocations, revoked allocations/sessions, validity windows, zero funding and binding changes. |
-| Actual signer usage, both signers | Real signer events from jobs against each orchestrator; ETH/USD fixed/live charging, recipient/session identity, ticket count/job type, exact allocation balances and ledger entries. |
-| Exhaustion/funding | Applied charges exhaust an allocation; later signing fails; additional funding restores eligibility; delayed/concurrent issuance permits recorded overdraw. |
-| Injected event validation | Identical replay without another charge; conflicting event IDs; malformed envelopes; invalid fees/counts/times; missing USD amounts; unknown sessions and recipient/app/type mismatches; unknown event types ignored. |
-| Persistence/outages, Node outbox | Broker interruption, pending signer outbox, signer restart/drain, clearinghouse restart, duplicate delivery, capacity failure withholding payment and unusable outbox storage failing startup. |
-| Revocation/late usage | Return unused allocation funds while recording actual previously issued usage delivered after revocation. |
-| Escrow, both signers | Deposit/reserve funding, claims, winning-ticket settlement, unlock/withdrawal and reconciliation with chain balances. |
-| Attribution | Both signers' usage matches settlement without another grant charge; delayed and unmatched attribution; ambiguous attribution using injected events. |
-| Listener recovery | Confirmations, persisted checkpoints, repeated logs, RPC outage, reorg rollback/replay and failure beyond retained reorg history. |
+Coverage includes ETH/USD budgets and keys; service permissions; authorization/revocation and validity windows; exact usage balances and ledger entries; exhaustion, funding, concurrent overdraw, late usage; malformed events, replay and conflicting IDs; and escrow/settlement attribution. Replay/quarantine cases create their own real USD event, so individual subtests can be selected directly.
 
-Management and Kafka proxy checks need no chain. Signing and usage coverage includes all four pairings and can run independently of listener compatibility. Escrow, settlement attribution and listener recovery require a compatible controlled chain.
+Node additionally tests durable outbox capacity, unusable storage, broker outages, and restart/drain. go-livepeer has an in-memory producer queue. Management and Kafka proxy tests need no chain. Signing/usage retain every paid backend/wallet pairing; settlement requires compatible chain headers and controls.
 
-go-livepeer usage charging, usage-based exhaustion and usage-to-settlement attribution use real signer events. Its in-memory producer queue has no durable outbox, so storage, capacity and restart/drain coverage applies to Node.
+`TestClearinghouseListenerRecovery` runs checkpoints/confirmations, RPC outage, reorg rollback/replay, and retained-history exhaustion once each using only a funded payer and Clearinghouse. These four cases need canonical headers and mining/snapshot controls, with no runner, signer, or Kafka fixture.
 
 ## Run artifacts
 
-Each run retains child logs in `artifacts` (or `E2E_ARTIFACT_DIR`) and writes `provenance.json` plus a timestamped provenance record. These generated files are ignored by Git. Provenance records configured source checkout revisions and working changes, binary paths/SHA-256, and Go build metadata; unconfigured source checkouts are omitted. Temporary build binaries and secret material are removed on ordinary completion. A supplied prebuilt binary's build revision may differ from its configured source checkout and is recorded separately.
+Each run writes child logs, `provenance.json`, and a timestamped provenance record under `E2E_ARTIFACT_DIR` (default `artifacts`), ignored by Git. Provenance includes configured checkout revisions/working changes and binary paths, SHA-256, and Go build metadata. Prebuilt binary revisions may differ from checkout revisions and are recorded separately. Temporary binaries and secrets are removed on ordinary completion.
 
-A successful full-suite run requires all product and infrastructure checks to pass. Failed prerequisites leave their dependent assertions unvalidated. Finality, canonical header decoding, and chain controls are reported separately to identify missing capabilities in the selected environment.
+A full-suite pass requires every product and infrastructure check to pass. Failed prerequisites leave dependent behavior unvalidated.

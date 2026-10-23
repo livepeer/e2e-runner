@@ -89,7 +89,10 @@ func startSigner(t *testing.T, opts signerOptions) *testSigner {
 		}
 	}
 	opts.dir = dir
-	s := &testSigner{backend: opts.backend, base: base, metricsBase: publicURL(t, "http://"+metricsAddr), account: opts.account, opts: opts}
+	s := &testSigner{backend: opts.backend, base: base, account: opts.account, opts: opts}
+	if opts.backend == "node" {
+		s.metricsBase = publicURL(t, "http://"+metricsAddr)
+	}
 	s.process = startChild(t, "signer-"+opts.backend, binary(t, opts.backend), dir, args)
 	s.logPath = s.process.logPath
 	waitForHTTP(t, http.MethodPost, s.base+"/sign-orchestrator-info", 200, s.logPath)
@@ -413,22 +416,22 @@ func (orch *testOrchestrator) infoAddress() common.Address {
 	}
 	return orch.paymentRecipient()
 }
-func (f *paidFixture) register(t *testing.T, label, mode, unit string, proxy bool) heartbeatResponse {
-	t.Helper()
+func paidPrice(unit string) priceInfo {
 	price := "0.001"
 	if unit == "hour" {
 		price = "3.6"
 	}
-	return registerRunnerHTTP(t, f.orch, heartbeatPayload{Label: label, Proxy: proxy, RunnerURL: f.upstream.url, Mode: mode, App: liveRunnerApp, Metadata: label, Capacity: 2, PriceInfo: priceInfo{Price: json.Number(price), Currency: "usd", Unit: unit}}, liveRunnerSecret)
+	return priceInfo{Price: json.Number(price), Currency: "usd", Unit: unit}
+}
+
+func (f *paidFixture) register(t *testing.T, label, mode, unit string, proxy bool) heartbeatResponse {
+	t.Helper()
+	return registerRunnerHTTP(t, f.orch, heartbeatPayload{Proxy: proxy, RunnerURL: f.upstream.url, Mode: mode, App: liveRunnerApp, Metadata: label, Capacity: 2, PriceInfo: paidPrice(unit)}, liveRunnerSecret)
 }
 func (f *paidFixture) job(t *testing.T, unit, mode string) *paymentJob {
 	t.Helper()
 	reg := f.register(t, fmt.Sprintf("case-%d", time.Now().UnixNano()), mode, unit, false)
-	price := "0.001"
-	if unit == "hour" {
-		price = "3.6"
-	}
-	stop := maintainRunner(t, f.orch, reg, heartbeatPayload{RunnerID: reg.RunnerID, RunnerURL: f.upstream.url, Mode: mode, App: liveRunnerApp, Status: "ready", Capacity: 2, PriceInfo: priceInfo{Price: json.Number(price), Currency: "usd", Unit: unit}})
+	stop := maintainRunner(t, f.orch, reg, heartbeatPayload{RunnerID: reg.RunnerID, RunnerURL: f.upstream.url, Mode: mode, App: liveRunnerApp, Status: "ready", Capacity: 2, PriceInfo: paidPrice(unit)})
 	orch := f.orch
 	var once sync.Once
 	closeRunner := func() { once.Do(func() { stop(); unregisterPaidRunner(t, orch, reg.RunnerID, reg.HeartbeatSecret) }) }
@@ -513,7 +516,11 @@ func TestOnchainPayments(t *testing.T) {
 		runPaidMatrix(t, f)
 		runPaymentBoundaries(t, f)
 		runPriceRegistration(t, f)
-		runExtendedPayments(t, f)
+		runPaymentAdmission(t, f)
+		runFundingCases(t, f)
+		runWebhookCases(t, f)
+		runConfiguredCeilings(t, f)
+		runDistinctConcurrentPayments(t, f)
 		runPaidLifecycle(t, f)
 		t.Run("paid multitrack media", func(t *testing.T) { runMediaRoundTrip(t, f.orch, f.signer) })
 	})
@@ -525,12 +532,8 @@ func runPaidMatrix(t *testing.T, f *paidFixture) {
 				for _, unit := range []string{"fixed", "hour"} {
 					for _, proxy := range []bool{false, true} {
 						t.Run(fmt.Sprintf("%s/%s/proxy-%t", mode, unit, proxy), func(t *testing.T) {
-							price := "0.001"
-							if unit == "hour" {
-								price = "3.6"
-							}
 							label := fmt.Sprintf("sdk-%d", time.Now().UnixNano())
-							reg := impl.Start(t, context.Background(), f.orch, runnerConfig{runnerURL: f.upstream.url, label: label, metadata: label, mode: mode, capacity: 2, proxy: proxy, price: priceInfo{Price: json.Number(price), Currency: "usd", Unit: unit}})
+							reg := impl.Start(t, context.Background(), f.orch, runnerConfig{runnerURL: f.upstream.url, metadata: label, mode: mode, capacity: 2, proxy: proxy, price: paidPrice(unit)})
 							discovered := waitRunnerByMetadata(t, f.orch, label)
 							require.NotNil(t, discovered.PriceInfo)
 							require.Equal(t, "wei", discovered.PriceInfo.Currency)
@@ -610,7 +613,7 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 	t.Run("malformed signer requests", func(t *testing.T) {
 		for _, req := range []any{map[string]any{}, map[string]any{"orchestrator": "!!!", "type": "fixed"}, map[string]any{"orchestrator": "AA==", "type": "unknown"}} {
 			status, body := httpJSON(t, "POST", f.signer.base+"/generate-live-payment", req, nil)
-			require.Equal(t, 400, status, string(body))
+			requireRejection(t, status, body, 400)
 		}
 	})
 	t.Run("state continuation and binding", func(t *testing.T) {
@@ -638,7 +641,7 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 					req[change] = "mismatch"
 				}
 				status, body := httpJSON(t, "POST", f.signer.base+"/generate-live-payment", req, nil)
-				require.Equal(t, 400, status, string(body))
+				requireRejection(t, status, body, 400)
 			})
 		}
 	})
@@ -652,11 +655,7 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 				raw := decode64(t, headers[field])
 				raw[len(raw)-1] ^= 1
 				headers[field] = base64.StdEncoding.EncodeToString(raw)
-				before := f.upstream.calls.Load()
-				status, body := httpJSON(t, "POST", j.target(), nil, headers)
-				require.GreaterOrEqual(t, status, 400, string(body))
-				require.Equal(t, before, f.upstream.calls.Load())
-				requireRunnerCapacity(t, requireDiscoveredRunner(t, f.orch, j.route), 2, 0, 2)
+				f.rejectAdmission(t, j, headers)
 			})
 		}
 	})
@@ -671,10 +670,11 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 				req := j.request()
 				req["orchestrator"] = base64.StdEncoding.EncodeToString(replaceWire(t, original, 2, protowire.BytesType, bad))
 				status, body := httpJSON(t, "POST", f.signer.base+"/generate-live-payment", req, nil)
-				require.GreaterOrEqual(t, status, 400, string(body))
-				var response signedPayment
-				_ = json.Unmarshal(body, &response)
-				require.Empty(t, response.Payment)
+				expected := 400
+				if f.signer.backend == "go-livepeer" && (field == 2 || field == 3) {
+					expected = 482 // Zero EV produces no tickets in the legacy signer.
+				}
+				requireRejection(t, status, body, expected)
 			})
 		}
 	})
@@ -710,8 +710,7 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 					require.NoError(t, json.Unmarshal(body, &payment))
 					require.Equal(t, 100, ticketCount(t, payment))
 				} else {
-					require.GreaterOrEqual(t, status, 400, string(body))
-					assertNoCredentials(t, body)
+					requireRejection(t, status, body, 400)
 				}
 			})
 		}
@@ -735,8 +734,7 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 				req := j.request()
 				req["orchestrator"] = base64.StdEncoding.EncodeToString(replaceWire(t, info, 3, protowire.BytesType, price))
 				status, body := httpJSON(t, "POST", f.signer.base+"/generate-live-payment", req, nil)
-				require.GreaterOrEqual(t, status, 400, string(body))
-				assertNoCredentials(t, body)
+				requireRejection(t, status, body, 400)
 			})
 		}
 		t.Run("face exceeds escrow", func(t *testing.T) {
@@ -750,8 +748,7 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 			req := j.request()
 			req["orchestrator"] = base64.StdEncoding.EncodeToString(replaceWire(t, info, 2, protowire.BytesType, params))
 			status, body := httpJSON(t, "POST", f.signer.base+"/generate-live-payment", req, nil)
-			require.GreaterOrEqual(t, status, 400, string(body))
-			assertNoCredentials(t, body)
+			requireRejection(t, status, body, 400)
 		})
 	})
 	t.Run("refresh authorization", func(t *testing.T) {
@@ -762,8 +759,8 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 		defer stopPaidSession(t, f.orch, j.route, session.SessionID)
 		status, body := httpJSON(t, "POST", f.orch.httpBase+"/refresh-payment", map[string]any{"sender": f.payer.address.Hex(), "manifest_id": j.challenge.ManifestID}, nil)
 		require.Equal(t, 200, status, string(body))
-		status, _ = httpJSON(t, "POST", f.orch.httpBase+"/refresh-payment", map[string]any{"sender": common.HexToAddress("0xdead").Hex(), "manifest_id": j.challenge.ManifestID}, nil)
-		require.GreaterOrEqual(t, status, 400)
+		status, body = httpJSON(t, "POST", f.orch.httpBase+"/refresh-payment", map[string]any{"sender": common.HexToAddress("0xdead").Hex(), "manifest_id": j.challenge.ManifestID}, nil)
+		requireRejection(t, status, body, 404, 409)
 	})
 	t.Run("unfunded signer", func(t *testing.T) {
 		account := f.chain.newAccount(t, true)
@@ -772,10 +769,7 @@ func runPaymentBoundaries(t *testing.T, f *paidFixture) {
 		j.signer = s
 		j.obtainChallenge(t, f.payer.address)
 		status, body := j.generate(t, nil)
-		require.GreaterOrEqual(t, status, 400, string(body))
-		var p signedPayment
-		_ = json.Unmarshal(body, &p)
-		require.Empty(t, p.Payment)
+		requireRejection(t, status, body, 400)
 	})
 	for _, lifecycle := range []string{"replica", "restart"} {
 		t.Run("signer "+lifecycle+" continuation", func(t *testing.T) {
@@ -847,4 +841,27 @@ func stateEnvelopeKey(t *testing.T, state map[string]any) string {
 	}
 	t.Fatal("signed state missing encoded state")
 	return ""
+}
+
+func requireRejection(t *testing.T, status int, body []byte, allowed ...int) {
+	t.Helper()
+	require.Contains(t, allowed, status, string(body))
+	assertNoCredentials(t, body)
+}
+
+func (f *paidFixture) rejectAdmission(t *testing.T, j *paymentJob, headers map[string]string) {
+	t.Helper()
+	before := f.upstream.calls.Load()
+	status, body := httpJSON(t, http.MethodPost, j.target(), nil, headers)
+	requireRejection(t, status, body, 400, 403)
+	require.Equal(t, before, f.upstream.calls.Load(), "rejected admission cannot invoke the application")
+	requireRunnerCapacity(t, requireDiscoveredRunner(t, f.orch, j.route), 2, 0, 2)
+}
+
+func assertNoCredentials(t *testing.T, body []byte) {
+	t.Helper()
+	var p signedPayment
+	_ = json.Unmarshal(body, &p)
+	require.Empty(t, p.Payment)
+	require.Empty(t, p.Segment)
 }

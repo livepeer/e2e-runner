@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -266,12 +267,9 @@ func (c *chainFixture) waitAccountIdle(t *testing.T, address common.Address) {
 }
 func ethAmount(t *testing.T, key, fallback string) *big.Int {
 	t.Helper()
-	r, ok := new(big.Rat).SetString(envDefault(key, fallback))
-	require.True(t, ok, key)
-	r.Mul(r, new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)))
-	require.True(t, r.IsInt(), key)
-	require.NotEqual(t, -1, r.Sign(), key)
-	return new(big.Int).Set(r.Num())
+	amount := decimalWei(t, envDefault(key, fallback))
+	require.NotEqual(t, -1, amount.Sign(), key)
+	return amount
 }
 func (c *chainFixture) newAccount(t *testing.T, funded bool) *chainAccount {
 	t.Helper()
@@ -702,4 +700,18 @@ func (c *chainFixture) transcoderRound(t *testing.T, address common.Address, fie
 	}
 	t.Fatalf("getTranscoder output %q missing from fixture ABI", field)
 	return nil
+}
+
+func decimalWei(t *testing.T, s string) *big.Int {
+	r, ok := new(big.Rat).SetString(s)
+	require.True(t, ok)
+	r.Mul(r, new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)))
+	require.True(t, r.IsInt())
+	return new(big.Int).Set(r.Num())
+}
+func senderEscrow(t *testing.T, c *chainFixture, a common.Address) (*big.Int, *big.Int, *big.Int) {
+	v := c.call(t, "ticketBroker", c.broker, "getSenderInfo", a)
+	sender := reflect.Indirect(reflect.ValueOf(v[0]))
+	reserve := reflect.Indirect(reflect.ValueOf(v[1]))
+	return sender.FieldByName("Deposit").Interface().(*big.Int), reserve.FieldByName("FundsRemaining").Interface().(*big.Int), sender.FieldByName("WithdrawRound").Interface().(*big.Int)
 }

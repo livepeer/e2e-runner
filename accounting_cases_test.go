@@ -2,13 +2,13 @@ package e2escope
 
 import (
 	"encoding/json"
+	"maps"
 	"math/big"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -128,7 +128,7 @@ func runLateAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 		for _, j := range jobs {
 			ch.paymentEvent(t, j.payment)
 		}
-		db := openReadDB(t, ch.db)
+		db := ch.readDB
 		rows, err := db.Query("SELECT u.computed_fee_wei FROM usage_events u JOIN payment_sessions s ON s.id=u.payment_session_id WHERE s.allocation_id=? AND u.status='applied'", k.Allocation)
 		require.NoError(t, err)
 		defer rows.Close()
@@ -148,7 +148,7 @@ func runLateAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 	}
 	t.Run("outbox storage failure", func(t *testing.T) {
 		opts := f.signer.opts
-		opts.kafka = cloneMap(opts.kafka)
+		opts.kafka = maps.Clone(opts.kafka)
 		opts.kafka["OutboxDB"] = "/dev/null/outbox.sqlite"
 		// Startup must reject an unusable durable sink before issuing any tickets.
 		dir := t.TempDir()
@@ -185,7 +185,7 @@ func runFullOutbox(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 		defer restore()
 		opts := f.signer.opts
 		opts.dir = ""
-		opts.kafka = cloneMap(opts.kafka)
+		opts.kafka = maps.Clone(opts.kafka)
 		opts.kafka["OutboxDB"] = filepath.Join(t.TempDir(), "full-outbox.sqlite")
 		opts.kafka["OutboxMaxBytes"] = int64(10000)
 		s := startSigner(t, opts)
@@ -213,39 +213,4 @@ func runFullOutbox(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
 		session := denied.submit(t)
 		stopPaidSession(t, f.orch, denied.route, session.SessionID)
 	})
-}
-
-func malformedEvent(raw []byte, change string) []byte {
-	var event map[string]any
-	_ = json.Unmarshal(raw, &event)
-	event["id"] = uuid.NewString()
-	data := event["data"].(map[string]any)
-	switch change {
-	case "zero count":
-		data["num_tickets"] = 0
-	case "fractional count":
-		data["num_tickets"] = 1.5
-	case "negative count":
-		data["num_tickets"] = -1
-	case "invalid time":
-		data["current_time_unix"] = "invalid"
-	case "negative timestamp":
-		data["current_time_unix"] = -1
-	case "negative USD":
-		data["computed_fee_usd"] = "-1"
-	case "nondecimal fee":
-		data["computed_fee"] = "NaN"
-	case "recipient mismatch":
-		data["orch_address"] = "0x0000000000000000000000000000000000001234"
-	case "app mismatch":
-		data["app"] = "wrong"
-	case "type mismatch":
-		data["pipeline"] = "wrong"
-	case "missing request":
-		delete(data, "request_id")
-	case "missing PM session":
-		delete(data, "pm_session_id")
-	}
-	result, _ := json.Marshal(event)
-	return result
 }

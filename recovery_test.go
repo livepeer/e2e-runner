@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -197,7 +198,7 @@ func waitSettlement(t *testing.T, f *paidFixture, ticket *observedTicket) *types
 
 func TestOnchainRecovery(t *testing.T) {
 	forEachPair(t, func(t *testing.T, orch, signer string, wallets walletMode) {
-		for _, scenario := range []string{"expired parameters", "redemption and duplicate", "pending restart", "RPC interruption", "failed transaction", "fee limit", "delayed finality", "reorg recovery"} {
+		for _, scenario := range []string{"expired parameters", "redemption and duplicate", "pending restart", "RPC interruption", "fee limit", "delayed finality", "reorg recovery"} {
 			t.Run(scenario, func(t *testing.T) {
 				c := preflightChain(t)
 				if scenario == "expired parameters" || scenario == "reorg recovery" {
@@ -255,7 +256,10 @@ func TestOnchainRecovery(t *testing.T) {
 					faults.highFee.Store(true)
 					f.orch.process.stop()
 					opts := f.orch.opts
-					opts.extra = cloneMap(opts.extra)
+					opts.extra = maps.Clone(opts.extra)
+					if opts.extra == nil {
+						opts.extra = map[string]any{}
+					}
 					opts.extra["RedeemerMaxFeePerGas"] = "1"
 					if orch == "go-livepeer" {
 						opts.goExtra = append(append([]string{}, opts.goExtra...), "-maxGasPrice", "1")
@@ -269,6 +273,19 @@ func TestOnchainRecovery(t *testing.T) {
 					require.Equal(t, common.Hash{}, pending.Tx, "restart begins with persisted, unsubmitted redemption")
 				}
 				c.advanceTo(t, ticket.Expiry+2)
+				if scenario == "pending restart" {
+					c.initializeRound(t, f.payer)
+					data, err := c.contracts["ticketBroker"].Pack("redeemWinningTicket", ticket, ticket.Signature, ticket.Random)
+					require.NoError(t, err)
+					var output hexutil.Bytes
+					ctx, cancel := chainContext(t)
+					defer cancel()
+					require.NoError(t, c.rpc.CallContext(ctx, &output, "eth_call", map[string]any{"from": f.redeemer.address, "to": c.broker, "data": hexutil.Bytes(data)}, "latest"), "original winning ticket must be redeemable before corrupting its signature")
+					signature := append([]byte(nil), ticket.Signature...)
+					signature[0] ^= 1
+					rejectRedemption(t, f, ticket, signature)
+				}
+
 				if scenario == "delayed finality" && orch == "go-livepeer" {
 					time.Sleep(1200 * time.Millisecond)
 					pending := observedWinning(t, f.orch, f.payer.address)
@@ -290,9 +307,11 @@ func TestOnchainRecovery(t *testing.T) {
 					faults.highFee.Store(false)
 					f.orch = startOrchestrator(t, normalOptions)
 				}
+				c.initializeRound(t, f.payer)
 				waitSettlement(t, f, ticket)
 				if scenario == "delayed finality" && orch == "node" {
 					db := openReadDB(t, paymentDB(f.orch))
+					defer db.Close()
 					var count int
 					require.NoError(t, db.QueryRow("SELECT count(*) FROM winning_tickets WHERE redeemed_at IS NOT NULL").Scan(&count))
 					require.Zero(t, count, "mined is not finalized")
@@ -318,28 +337,31 @@ func TestOnchainRecovery(t *testing.T) {
 					deposit2, reserve2, _ := senderEscrow(t, c, f.payer.address)
 					require.Equal(t, new(big.Int).Add(deposit, reserve).String(), new(big.Int).Add(deposit2, reserve2).String(), "one canonical settlement after reorg")
 				}
-				if scenario == "redemption and duplicate" || scenario == "failed transaction" {
+				if scenario == "redemption and duplicate" || scenario == "pending restart" {
 					f.orch.process.stop()
-					data, err := c.contracts["ticketBroker"].Pack("redeemWinningTicket", ticket, ticket.Signature, ticket.Random)
-					require.NoError(t, err)
-					if scenario == "failed transaction" {
-						ticket.Signature[0] ^= 1
-						data, err = c.contracts["ticketBroker"].Pack("redeemWinningTicket", ticket, ticket.Signature, ticket.Random)
-						require.NoError(t, err)
-					}
-					var output hexutil.Bytes
-					ctx, cancel := chainContext(t)
-					defer cancel()
-					err = c.rpc.CallContext(ctx, &output, "eth_call", map[string]any{"from": f.redeemer.address, "to": c.broker, "data": hexutil.Bytes(data)}, "latest")
-					require.Error(t, err, "duplicate or invalid redemption must revert")
-					failed := c.submit(t, f.redeemer.address, f.redeemer.key, common.Address{}, c.broker, data, new(big.Int))
-					require.Equal(t, uint64(0), failed.Status, "failed redemption has an actual reverted receipt")
-					d, r, _ := senderEscrow(t, c, f.payer.address)
-					require.Equal(t, new(big.Int).Add(deposit, reserve).String(), new(big.Int).Add(d, r).String(), "reverted redemption cannot debit escrow twice")
+					rejectRedemption(t, f, ticket, ticket.Signature)
 				}
 			})
 		}
 	})
+}
+
+func rejectRedemption(t *testing.T, f *paidFixture, ticket *observedTicket, signature []byte) {
+	t.Helper()
+	deposit, reserve, _ := senderEscrow(t, f.chain, f.payer.address)
+	data, err := f.chain.contracts["ticketBroker"].Pack("redeemWinningTicket", ticket, signature, ticket.Random)
+	require.NoError(t, err)
+	var output hexutil.Bytes
+	ctx, cancel := chainContext(t)
+	defer cancel()
+	err = f.chain.rpc.CallContext(ctx, &output, "eth_call", map[string]any{"from": f.redeemer.address, "to": f.chain.broker, "data": hexutil.Bytes(data)}, "latest")
+	require.Error(t, err, "invalid or duplicate redemption must revert")
+	failed := f.chain.submit(t, f.redeemer.address, f.redeemer.key, common.Address{}, f.chain.broker, data, new(big.Int))
+	require.Equal(t, uint64(0), failed.Status, "actual reverted redemption receipt")
+	t.Logf("reverted redemption transaction: %s", failed.TxHash)
+	d, r, _ := senderEscrow(t, f.chain, f.payer.address)
+	require.Equal(t, deposit.String(), d.String(), "reverted redemption preserves deposit")
+	require.Equal(t, reserve.String(), r.String(), "reverted redemption preserves reserve")
 }
 
 func (c *chainFixture) rpcTransaction(t *testing.T, hash common.Hash) (*types.Transaction, error) {
@@ -430,7 +452,7 @@ func runOracleObservations(t *testing.T, f *paidFixture) {
 			}
 			waitOracleAbsent(t, f.orch, "oracle-runner")
 			status, body := httpJSON(t, "POST", f.orch.httpBase+"/apps/oracle-runner/session", nil, map[string]string{"Livepeer-Payer-Address": f.payer.address.Hex()})
-			require.GreaterOrEqual(t, status, 400, string(body))
+			require.Contains(t, []int{404, 500, 502, 503}, status, string(body))
 			var challenge paymentChallenge
 			_ = json.Unmarshal(body, &challenge)
 			require.Empty(t, challenge.PaymentParams, "unavailable oracle must not issue usable payment parameters")

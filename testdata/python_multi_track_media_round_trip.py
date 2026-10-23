@@ -288,39 +288,17 @@ async def run(publish_url: str) -> dict[str, object]:
             and set(ratios) == {"440", "880"}
             and all(ratio >= 2.5 for ratio in ratios.values())
         )
-        errors = []
-        if len(observed_video) != 2:
-            errors.append(f"expected 2 video tracks, got {len(observed_video)}")
-        if len(observed_audio) != 2:
-            errors.append(f"expected 2 audio tracks, got {len(observed_audio)}")
-        if not video_ok:
-            errors.append("decoded video color signatures did not match")
-        if not audio_ok:
-            errors.append(f"decoded audio frequencies did not match: {ratios}")
-        if output_stats.segments_consumed <= 0:
-            errors.append("subscriber consumed no segments")
-        if media.get_stats().segments_started <= 0:
-            errors.append("publisher started no segments")
+        assert len(observed_video) == 2, observed_video
+        assert len(observed_audio) == 2, observed_audio
+        assert all(track.frame_count > 0 for track in observed_video.values())
+        assert all(len(track.samples) > 0 for track in observed_audio.values())
+        assert video_ok, "decoded video color signatures did not match"
+        assert audio_ok, f"decoded audio frequencies did not match: {ratios}"
+        assert output_stats.segments_consumed > 0, "subscriber consumed no segments"
+        assert media.get_stats().segments_started > 0, "publisher started no segments"
+        return {"audio_frequency_ratios": ratios, "segments_consumed": output_stats.segments_consumed,
+                "segments_started": media.get_stats().segments_started}
 
-        return {
-            "observed_video_tracks": len(observed_video),
-            "observed_audio_tracks": len(observed_audio),
-            "video_frame_counts": [
-                observed.frame_count
-                for _index, observed in sorted(observed_video.items())
-            ],
-            "audio_sample_counts": [
-                len(observed.samples)
-                for _index, observed in sorted(observed_audio.items())
-            ],
-            "video_signatures_ok": video_ok,
-            "audio_frequencies_ok": audio_ok,
-            "audio_frequency_ratios": ratios,
-            "segments_consumed": output_stats.segments_consumed,
-            "segments_started": media.get_stats().segments_started,
-            "verification_ok": not errors,
-            "errors": errors,
-        }
     finally:
         await media.close()
         if consumer_task is not None and not consumer_task.done():
@@ -330,23 +308,8 @@ async def run(publish_url: str) -> dict[str, object]:
 
 
 async def main() -> None:
-    try:
-        result = await run(sys.argv[1])
-    except Exception as exc:
-        result = {
-            "observed_video_tracks": 0,
-            "observed_audio_tracks": 0,
-            "video_frame_counts": [],
-            "audio_sample_counts": [],
-            "video_signatures_ok": False,
-            "audio_frequencies_ok": False,
-            "audio_frequency_ratios": {},
-            "segments_consumed": 0,
-            "segments_started": 0,
-            "verification_ok": False,
-            "errors": [f"{exc.__class__.__name__}: {exc}"],
-        }
-    print(json.dumps(result, separators=(",", ":")), flush=True)
+    result = await run(sys.argv[1])
+    print(json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":

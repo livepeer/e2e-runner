@@ -13,7 +13,7 @@ import (
 
 func TestClearinghouseChainRecovery(t *testing.T) {
 	forEachPair(t, func(t *testing.T, orch, signer string, wallets walletMode) {
-		for _, scenario := range []string{"escrow and withdrawal", "matched settlement", "delayed attribution", "unmatched settlement", "ambiguous attribution fixture", "confirmations and checkpoints", "RPC outage", "reorg rollback replay", "reorg beyond boundary"} {
+		for _, scenario := range []string{"escrow and withdrawal", "matched settlement", "delayed attribution", "unmatched settlement", "ambiguous attribution fixture"} {
 			t.Run(scenario, func(t *testing.T) {
 				c := preflightChain(t)
 				c.requireCanonicalHeaders(t)
@@ -21,7 +21,6 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 				if orch == "node" {
 					c.requireFinality(t)
 				}
-				faults := faultRPC(t, c)
 				ch := startClearinghouse(t, c, true)
 				kafkaConfig := ch.signerKafkaConfig(t, signer)
 				if scenario == "escrow and withdrawal" {
@@ -36,76 +35,6 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 				ch.enableListener(t, f.payer.address.Hex())
 				waitChainCheckpoint(t, ch, c.block(t)-2)
 				k := ch.key(t, "eth", "1")
-				if scenario == "RPC outage" {
-					before := chainCheckpoint(t, ch)
-					faults.down.Store(true)
-					// Administrative chain calls still use the real endpoint; only the
-					// processes under test lose their RPC connection.
-					c.fundPayer(t, f.payer, big.NewInt(17), big.NewInt(29))
-					time.Sleep(700 * time.Millisecond)
-					require.Equal(t, before, chainCheckpoint(t, ch))
-					faults.down.Store(false)
-					c.mineTo(t, c.block(t)+3)
-					waitChainCheckpoint(t, ch, c.block(t)-2)
-					assertEscrowReconciled(t, ch, f)
-					return
-				}
-				if scenario == "confirmations and checkpoints" {
-					before := eventCount(t, ch)
-					c.fundPayer(t, f.payer, big.NewInt(17), big.NewInt(29))
-					height := c.block(t)
-					if c.block(t) < height+2 {
-						require.Equal(t, before, eventCount(t, ch), "unconfirmed logs excluded")
-					}
-					c.mineTo(t, height+3)
-					waitChainCheckpoint(t, ch, height+1)
-					require.Greater(t, eventCount(t, ch), before)
-					checkpoint := chainCheckpoint(t, ch)
-					events := eventCount(t, ch)
-					ch.restart(t)
-					require.GreaterOrEqual(t, chainCheckpoint(t, ch), checkpoint)
-					require.Equal(t, events, eventCount(t, ch), "saved checkpoint prevents replay charges")
-					assertEscrowReconciled(t, ch, f)
-					return
-				}
-				if scenario == "reorg rollback replay" || scenario == "reorg beyond boundary" {
-					var snapshot string
-					c.request(t, &snapshot, "evm_snapshot")
-					before := eventCount(t, ch)
-					c.fundPayer(t, f.payer, big.NewInt(17), big.NewInt(29))
-					c.mineTo(t, c.block(t)+3)
-					waitChainCheckpoint(t, ch, c.block(t)-2)
-					require.Greater(t, eventCount(t, ch), before)
-					if scenario == "reorg beyond boundary" {
-						c.mineTo(t, c.block(t)+12)
-						waitChainCheckpoint(t, ch, c.block(t)-2)
-					}
-					ch.process.stop()
-					var restored bool
-					c.request(t, &restored, "evm_revert", snapshot)
-					require.True(t, restored)
-					// Orchestrator workers still run in this listener-only reorg;
-					// initialize through the fixture payer to avoid racing R's nonce.
-					c.initializeRound(t, f.payer)
-					require.True(t, c.recipientActive(t, f.recipient), "recipient remains active after reorg")
-					c.mineTo(t, c.block(t)+4)
-					ch.restart(t)
-					if scenario == "reorg beyond boundary" {
-						eventually(t, func() bool {
-							return strings.Contains(readLog(t, ch.process.logPath), "reorg exceeds retained common-ancestor history")
-						}, envDuration(t, "E2E_ACCOUNTING_TIMEOUT", "20s"), 100*time.Millisecond)
-						return
-					}
-					waitChainCheckpoint(t, ch, c.block(t)-2)
-					assertEscrowReconciled(t, ch, f)
-					count := eventCount(t, ch)
-					c.fundPayer(t, f.payer, big.NewInt(31), big.NewInt(47))
-					c.mineTo(t, c.block(t)+3)
-					waitChainCheckpoint(t, ch, c.block(t)-2)
-					require.Greater(t, eventCount(t, ch), count)
-					assertEscrowReconciled(t, ch, f)
-					return
-				}
 				if scenario == "delayed attribution" {
 					ch.config["EnableAccounting"] = false
 					ch.restart(t)
@@ -129,7 +58,7 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 				c.mineTo(t, receipt.BlockNumber.Uint64()+3)
 				waitChainCheckpoint(t, ch, receipt.BlockNumber.Uint64()+1)
 				require.Positive(t, countSettlements(t, ch, "settled"))
-				assertEscrowReconciled(t, ch, f)
+				assertEscrowReconciled(t, ch, c, f.payer)
 				if scenario == "escrow and withdrawal" {
 					require.Positive(t, scalarInt(t, ch, "SELECT count(*) FROM ticket_broker_events WHERE event_type='reserve_claimed'"))
 					c.transact(t, f.payer, "ticketBroker", c.broker, "unlock", new(big.Int))
@@ -144,7 +73,7 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 					deposit, reserve, _ := senderEscrow(t, c, f.payer.address)
 					require.Zero(t, deposit.Sign())
 					require.Zero(t, reserve.Sign())
-					assertEscrowReconciled(t, ch, f)
+					assertEscrowReconciled(t, ch, c, f.payer)
 					return
 				}
 				expected := "matched"
@@ -167,7 +96,7 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 					require.NoError(t, json.Unmarshal(raw, &event))
 					data := event["data"].(map[string]any)
 					stateID := uuid.NewString()
-					state := map[string]any{"StateID": stateID, "App": data["app"], "Type": data["pipeline"], "OrchestratorAddress": f.recipient.address.Hex()}
+					state := map[string]any{"StateID": stateID, "App": data["app"], "Type": data["pipeline"], "OrchestratorAddress": f.recipient.address.Hex(), "FeeWei": data["computed_fee"]}
 					status, body := httpJSON(t, "POST", ch.webhook+"/v1/signer/authorize", map[string]any{"state": state, "headers": map[string][]string{"Authorization": {"Bearer " + k.Key}}}, map[string]string{"Livepeer-Clearinghouse-Token": ch.signerSecret})
 					require.Equal(t, 200, status, string(body))
 					var decision map[string]any
@@ -190,14 +119,91 @@ func TestClearinghouseChainRecovery(t *testing.T) {
 	})
 }
 
-func scalarInt(t *testing.T, ch *clearinghouseFixture, query string, args ...any) int64 {
-	t.Helper()
-	db := openReadDB(t, ch.db)
-	defer db.Close()
-	var n int64
-	require.NoError(t, db.QueryRow(query, args...).Scan(&n))
-	return n
+// Listener recovery consumes protocol logs without a runner or payment signer.
+func TestClearinghouseListenerRecovery(t *testing.T) {
+	for _, scenario := range []string{"confirmations and checkpoints", "RPC outage", "reorg rollback replay", "reorg beyond boundary"} {
+		t.Run(scenario, func(t *testing.T) {
+			c := preflightChain(t)
+			c.requireCanonicalHeaders(t)
+			c.requireControl(t)
+			c.configureFunding(t)
+			payer := c.newAccount(t, true)
+			c.fundPayer(t, payer, decimalWei(t, "0.1"), decimalWei(t, "0.1"))
+			faults := faultRPC(t, c)
+			ch := startClearinghouse(t, c, false)
+			ch.config["ReorgLookback"] = int64(8)
+			ch.enableListener(t, payer.address.Hex())
+			c.mineTo(t, c.block(t)+3)
+			waitChainCheckpoint(t, ch, c.block(t)-2)
+
+			if scenario == "RPC outage" {
+				before := chainCheckpoint(t, ch)
+				faults.down.Store(true)
+				// Administrative chain calls still use the real endpoint; only the
+				// processes under test lose their RPC connection.
+				c.fundPayer(t, payer, big.NewInt(17), big.NewInt(29))
+				time.Sleep(700 * time.Millisecond)
+				require.Equal(t, before, chainCheckpoint(t, ch))
+				faults.down.Store(false)
+				c.mineTo(t, c.block(t)+3)
+				waitChainCheckpoint(t, ch, c.block(t)-2)
+				assertEscrowReconciled(t, ch, c, payer)
+				return
+			}
+			if scenario == "confirmations and checkpoints" {
+				before := eventCount(t, ch)
+				c.fundPayer(t, payer, big.NewInt(17), big.NewInt(29))
+				height := c.block(t)
+				if c.block(t) < height+2 {
+					require.Equal(t, before, eventCount(t, ch), "unconfirmed logs excluded")
+				}
+				c.mineTo(t, height+3)
+				waitChainCheckpoint(t, ch, height+1)
+				require.Greater(t, eventCount(t, ch), before)
+				checkpoint := chainCheckpoint(t, ch)
+				events := eventCount(t, ch)
+				ch.restart(t)
+				require.GreaterOrEqual(t, chainCheckpoint(t, ch), checkpoint)
+				require.Equal(t, events, eventCount(t, ch), "saved checkpoint prevents replay charges")
+				assertEscrowReconciled(t, ch, c, payer)
+				return
+			}
+			var snapshot string
+			c.request(t, &snapshot, "evm_snapshot")
+			before := eventCount(t, ch)
+			c.fundPayer(t, payer, big.NewInt(17), big.NewInt(29))
+			c.mineTo(t, c.block(t)+3)
+			waitChainCheckpoint(t, ch, c.block(t)-2)
+			require.Greater(t, eventCount(t, ch), before)
+			if scenario == "reorg beyond boundary" {
+				c.mineTo(t, c.block(t)+12)
+				waitChainCheckpoint(t, ch, c.block(t)-2)
+			}
+			ch.process.stop()
+			var restored bool
+			c.request(t, &restored, "evm_revert", snapshot)
+			require.True(t, restored)
+			c.initializeRound(t, payer)
+			c.mineTo(t, c.block(t)+4)
+			ch.restart(t)
+			if scenario == "reorg beyond boundary" {
+				eventually(t, func() bool {
+					return strings.Contains(readLog(t, ch.process.logPath), "reorg exceeds retained common-ancestor history")
+				}, envDuration(t, "E2E_ACCOUNTING_TIMEOUT", "20s"), 100*time.Millisecond)
+				return
+			}
+			waitChainCheckpoint(t, ch, c.block(t)-2)
+			assertEscrowReconciled(t, ch, c, payer)
+			count := eventCount(t, ch)
+			c.fundPayer(t, payer, big.NewInt(31), big.NewInt(47))
+			c.mineTo(t, c.block(t)+3)
+			waitChainCheckpoint(t, ch, c.block(t)-2)
+			require.Greater(t, eventCount(t, ch), count)
+			assertEscrowReconciled(t, ch, c, payer)
+		})
+	}
 }
+
 func eventCount(t *testing.T, ch *clearinghouseFixture) int64 {
 	return scalarInt(t, ch, "SELECT count(*) FROM ticket_broker_events WHERE status='canonical'")
 }
@@ -211,10 +217,10 @@ func waitChainCheckpoint(t *testing.T, ch *clearinghouseFixture, block uint64) {
 	t.Helper()
 	eventually(t, func() bool { return chainCheckpoint(t, ch) > int64(block) }, envDuration(t, "E2E_ACCOUNTING_TIMEOUT", "20s"), 100*time.Millisecond, "listener checkpoint beyond %d: %s", block, readLog(t, ch.process.logPath))
 }
-func assertEscrowReconciled(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
+func assertEscrowReconciled(t *testing.T, ch *clearinghouseFixture, c *chainFixture, payer *chainAccount) {
 	t.Helper()
-	deposit, reserve, _ := senderEscrow(t, f.chain, f.payer.address)
-	owner := f.chain.chainID.String() + ":" + strings.ToLower(f.chain.broker.Hex()) + ":" + strings.ToLower(f.payer.address.Hex())
+	deposit, reserve, _ := senderEscrow(t, c, payer.address)
+	owner := c.chainID.String() + ":" + strings.ToLower(c.broker.Hex()) + ":" + strings.ToLower(payer.address.Hex())
 	for _, value := range []struct {
 		kind string
 		want *big.Int

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"maps"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 
 type clearinghouseFixture struct {
 	dir, db, management, webhook, broker, topic, operator, signerSecret, producerPassword, readonly string
+	readDB                                                                                          *sql.DB
 	config                                                                                          map[string]any
 	process                                                                                         *childProcess
 	chain                                                                                           *chainFixture
@@ -50,6 +52,8 @@ func startClearinghouse(t *testing.T, c *chainFixture, accounting bool) *clearin
 		ch.broker = tunneledKafka(t, ch.broker)
 	}
 	ch.restart(t)
+	ch.readDB = openReadDB(t, ch.db)
+	t.Cleanup(func() { require.NoError(t, ch.readDB.Close()) })
 	return ch
 }
 func (ch *clearinghouseFixture) restart(t *testing.T) {
@@ -109,19 +113,18 @@ func openReadDB(t *testing.T, path string) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 func (ch *clearinghouseFixture) scalar(t *testing.T, query string, args ...any) string {
 	t.Helper()
-	db := openReadDB(t, ch.db)
+	db := ch.readDB
 	var result string
 	require.NoError(t, db.QueryRow(query, args...).Scan(&result))
 	return result
 }
 func (ch *clearinghouseFixture) usageCount(t *testing.T, status string) int {
 	t.Helper()
-	db := openReadDB(t, ch.db)
+	db := ch.readDB
 	var n int
 	require.NoError(t, db.QueryRow("SELECT count(*) FROM usage_events WHERE status=?", status).Scan(&n))
 	return n
@@ -150,7 +153,7 @@ func (ch *clearinghouseFixture) publish(t *testing.T, raw []byte) {
 }
 func (ch *clearinghouseFixture) latestEvent(t *testing.T) []byte {
 	t.Helper()
-	db := openReadDB(t, ch.db)
+	db := ch.readDB
 	var raw []byte
 	require.NoError(t, db.QueryRow("SELECT raw_payload FROM usage_events WHERE status='applied' ORDER BY created_at_ms DESC,offset DESC LIMIT 1").Scan(&raw))
 	return raw
@@ -159,8 +162,7 @@ func (ch *clearinghouseFixture) latestEvent(t *testing.T) []byte {
 func (ch *clearinghouseFixture) paymentEvent(t *testing.T, payment signedPayment) []byte {
 	t.Helper()
 	authID := stateObject(t, payment)["AuthID"]
-	db := openReadDB(t, ch.db)
-	defer db.Close()
+	db := ch.readDB
 	var raw []byte
 	eventually(t, func() bool {
 		err := db.QueryRow("SELECT raw_payload FROM usage_events WHERE status='applied' AND payment_session_id=? ORDER BY created_at_ms DESC,offset DESC LIMIT 1", authID).Scan(&raw)
@@ -173,9 +175,6 @@ func (ch *clearinghouseFixture) paymentEvent(t *testing.T, payment signedPayment
 	return raw
 }
 
-func (ch *clearinghouseFixture) chargedForAuth(t *testing.T, authID any) string {
-	return ch.scalar(t, "SELECT b.balance_units FROM payment_sessions s JOIN grant_allocations a ON a.id=s.allocation_id JOIN account_balances b ON b.account_id=a.id AND b.currency=a.currency AND b.account_type='allocation_spent' WHERE s.id=?", authID)
-}
 func TestClearinghouseManagement(t *testing.T) {
 	ch := startClearinghouse(t, nil, true)
 	t.Run("service permissions", func(t *testing.T) {
@@ -236,7 +235,7 @@ func TestClearinghouseManagement(t *testing.T) {
 	}
 	t.Run("webhook key and lifecycle", func(t *testing.T) {
 		k := ch.key(t, "eth", "1")
-		state := map[string]any{"StateID": uuid.NewString(), "OrchestratorAddress": "0x0000000000000000000000000000000000001234", "App": "e2e", "Type": "fixed"}
+		state := map[string]any{"StateID": uuid.NewString(), "OrchestratorAddress": "0x0000000000000000000000000000000000001234", "App": "e2e", "Type": "fixed", "FeeWei": "1"}
 		authorize := func(headers any) map[string]any {
 			status, body := httpJSON(t, "POST", ch.webhook+"/v1/signer/authorize", map[string]any{"headers": headers, "state": state}, map[string]string{"Livepeer-Clearinghouse-Token": ch.signerSecret})
 			require.Equal(t, 200, status, string(body))
@@ -307,7 +306,7 @@ func TestClearinghouseSigning(t *testing.T) {
 			ch.request(t, "GET", "/v1/escrow/activity", nil, 200, nil)
 			c.fundPayer(t, f.payer, big.NewInt(1000000000), big.NewInt(2000000000))
 			eventually(t, func() bool {
-				db := openReadDB(t, ch.db)
+				db := ch.readDB
 				var n int
 				err := db.QueryRow("SELECT count(*) FROM ticket_broker_events").Scan(&n)
 				return err == nil && n >= 2
@@ -320,7 +319,6 @@ func TestClearinghouseSigning(t *testing.T) {
 }
 
 func runSignerAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture) {
-	var rawFixture []byte
 	for _, currency := range []string{"eth", "usd"} {
 		for _, unit := range []string{"fixed", "hour"} {
 			t.Run("usage/"+currency+"/"+unit, func(t *testing.T) {
@@ -330,9 +328,6 @@ func runSignerAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture)
 				j.obtainChallenge(t)
 				j.sign(t, k.headers())
 				raw := ch.paymentEvent(t, j.payment)
-				if currency == "usd" {
-					rawFixture = raw
-				}
 				var event struct {
 					ID, Type string
 					Data     map[string]any
@@ -361,79 +356,29 @@ func runSignerAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture)
 		}
 	}
 	t.Run("replay and quarantine", func(t *testing.T) {
-		raw := rawFixture
-		if len(raw) == 0 {
-			raw = ch.latestEvent(t)
-		}
-		var seed struct {
-			ID   string
-			Data map[string]any
-		}
-		require.NoError(t, json.Unmarshal(raw, &seed))
-		authID := seed.Data["auth_id"]
-		balance := ch.chargedForAuth(t, authID)
-		duplicates := ch.usageCount(t, "duplicate")
-		ch.publish(t, raw)
-		ch.waitUsage(t, "duplicate", duplicates+1)
-		require.Equal(t, balance, ch.chargedForAuth(t, authID), "identical replay cannot charge allocation twice")
-		for _, change := range []string{"conflicting-id", "missing-auth", "wrong-session", "negative-fee", "missing-usd", "ticket-count", "unknown-type", "malformed"} {
+		k := ch.key(t, "usd", "1")
+		j := f.job(t, "fixed", "persistent")
+		j.obtainChallenge(t)
+		j.sign(t, k.headers())
+		raw := ch.paymentEvent(t, j.payment)
+		balance := ch.balance(t, k, "allocation_spent")
+		for _, change := range []string{"replay", "conflicting-id", "missing-auth", "wrong-session", "negative-fee", "missing-usd", "ticket-count", "unknown-type", "malformed", "zero count", "fractional count", "negative count", "invalid time", "negative timestamp", "negative USD", "nondecimal fee", "recipient mismatch", "app mismatch", "type mismatch", "missing request", "missing PM session"} {
 			t.Run(change, func(t *testing.T) {
-				var env map[string]any
-				require.NoError(t, json.Unmarshal(raw, &env))
-				if change != "conflicting-id" {
-					env["id"] = uuid.NewString()
-				}
-				data := env["data"].(map[string]any)
-				switch change {
-				case "conflicting-id":
-					data["request_id"] = "conflict"
-				case "missing-auth":
-					data["auth_id"] = "unknown"
-				case "wrong-session":
-					data["session_id"] = "wrong"
-				case "negative-fee":
-					data["computed_fee"] = "-1"
-				case "missing-usd":
-					delete(data, "computed_fee_usd")
-				case "ticket-count":
-					data["num_tickets"] = 101
-				case "unknown-type":
-					env["type"] = "unrelated"
-				}
-				payload, err := json.Marshal(env)
-				require.NoError(t, err)
-				if change == "malformed" {
-					payload = []byte("{")
-				}
 				expected := "quarantined"
-				if change == "unknown-type" {
+				switch change {
+				case "replay":
+					expected = "duplicate"
+				case "unknown-type":
 					expected = "ignored"
 				}
 				before := ch.usageCount(t, expected)
-				ch.publish(t, payload)
+				ch.publish(t, malformedEvent(t, raw, change))
 				ch.waitUsage(t, expected, before+1)
-				require.Equal(t, balance, ch.chargedForAuth(t, authID))
+				require.Equal(t, balance.String(), ch.balance(t, k, "allocation_spent").String(), "invalid usage cannot charge the allocation")
 			})
 		}
 	})
-	t.Run("additional malformed fixtures", func(t *testing.T) {
-		raw := rawFixture
-		if len(raw) == 0 {
-			raw = ch.latestEvent(t)
-		}
-		var seed struct{ Data map[string]any }
-		require.NoError(t, json.Unmarshal(raw, &seed))
-		authID := seed.Data["auth_id"]
-		balance := ch.chargedForAuth(t, authID)
-		for _, change := range []string{"zero count", "fractional count", "negative count", "invalid time", "negative timestamp", "negative USD", "nondecimal fee", "recipient mismatch", "app mismatch", "type mismatch", "missing request", "missing PM session"} {
-			t.Run(change, func(t *testing.T) {
-				n := ch.usageCount(t, "quarantined")
-				ch.publish(t, malformedEvent(raw, change))
-				ch.waitUsage(t, "quarantined", n+1)
-				require.Equal(t, balance, ch.chargedForAuth(t, authID), "quarantined usage cannot charge the allocation")
-			})
-		}
-	})
+
 	t.Run("exhaustion funding and overdraw", func(t *testing.T) {
 		k := ch.key(t, "eth", "0.000000000000000001")
 		j := f.job(t, "fixed", "persistent")
@@ -475,7 +420,7 @@ func runSignerAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture)
 	t.Run("outbox capacity withholds payment", func(t *testing.T) {
 		opts := f.signer.opts
 		opts.dir = ""
-		opts.kafka = cloneMap(opts.kafka)
+		opts.kafka = maps.Clone(opts.kafka)
 		opts.kafka["OutboxDB"] = filepath.Join(t.TempDir(), "tiny.sqlite")
 		opts.kafka["OutboxMaxBytes"] = int64(1)
 		s := startSigner(t, opts)
@@ -491,17 +436,78 @@ func runSignerAccounting(t *testing.T, ch *clearinghouseFixture, f *paidFixture)
 	})
 	runFullOutbox(t, ch, f)
 }
-func cloneMap(m map[string]any) map[string]any {
-	out := map[string]any{}
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
-}
 func outboxCount(t *testing.T, path string) int {
 	t.Helper()
 	db := openReadDB(t, path)
+	defer db.Close()
 	var n int
 	require.NoError(t, db.QueryRow("SELECT count(*) FROM signer_kafka_events").Scan(&n))
+	return n
+}
+
+func malformedEvent(t *testing.T, raw []byte, change string) []byte {
+	t.Helper()
+	if change == "replay" {
+		return raw
+	}
+	if change == "malformed" {
+		return []byte("{")
+	}
+	var event map[string]any
+	require.NoError(t, json.Unmarshal(raw, &event))
+	if change != "conflicting-id" {
+		event["id"] = uuid.NewString()
+	}
+	data := event["data"].(map[string]any)
+	switch change {
+	case "conflicting-id":
+		data["request_id"] = "conflict"
+	case "missing-auth":
+		data["auth_id"] = "unknown"
+	case "wrong-session":
+		data["session_id"] = "wrong"
+	case "negative-fee":
+		data["computed_fee"] = "-1"
+	case "missing-usd":
+		delete(data, "computed_fee_usd")
+	case "ticket-count":
+		data["num_tickets"] = 101
+	case "unknown-type":
+		event["type"] = "unrelated"
+	case "zero count":
+		data["num_tickets"] = 0
+	case "fractional count":
+		data["num_tickets"] = 1.5
+	case "negative count":
+		data["num_tickets"] = -1
+	case "invalid time":
+		data["current_time_unix"] = "invalid"
+	case "negative timestamp":
+		data["current_time_unix"] = -1
+	case "negative USD":
+		data["computed_fee_usd"] = "-1"
+	case "nondecimal fee":
+		data["computed_fee"] = "NaN"
+	case "recipient mismatch":
+		data["orch_address"] = "0x0000000000000000000000000000000000001234"
+	case "app mismatch":
+		data["app"] = "wrong"
+	case "type mismatch":
+		data["pipeline"] = "wrong"
+	case "missing request":
+		delete(data, "request_id")
+	case "missing PM session":
+		delete(data, "pm_session_id")
+	}
+	result, err := json.Marshal(event)
+	require.NoError(t, err)
+	return result
+}
+
+func scalarInt(t *testing.T, ch *clearinghouseFixture, query string, args ...any) int64 {
+	t.Helper()
+	db := ch.readDB
+	var n int64
+	require.NoError(t, db.QueryRow(query, args...).Scan(&n))
 	return n
 }

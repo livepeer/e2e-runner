@@ -1,14 +1,11 @@
 package e2escope
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"io"
 	"math/big"
 	"net/http"
 	"net/url"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,9 +16,9 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
-func runExtendedPayments(t *testing.T, f *paidFixture) {
+func runPaymentAdmission(t *testing.T, f *paidFixture) {
 	t.Run("discovery filtering", func(t *testing.T) {
-		reg := registerRunnerHTTP(t, f.orch, heartbeatPayload{Label: "gpu-discovery", RunnerURL: f.upstream.url, Mode: "persistent", App: liveRunnerApp, Metadata: "gpu-discovery", Capacity: 2, Status: "ready", GPU: map[string]any{"name": "E2E GPU", "vram_mb": 24576}, PriceInfo: priceInfo{Price: "0.001", Currency: "usd", Unit: "fixed"}}, liveRunnerSecret)
+		reg := registerRunnerHTTP(t, f.orch, heartbeatPayload{RunnerURL: f.upstream.url, Mode: "persistent", App: liveRunnerApp, Metadata: "gpu-discovery", Capacity: 2, Status: "ready", GPU: map[string]any{"name": "E2E GPU", "vram_mb": 24576}, PriceInfo: priceInfo{Price: "0.001", Currency: "usd", Unit: "fixed"}}, liveRunnerSecret)
 		t.Cleanup(func() { unregisterPaidRunner(t, f.orch, reg.RunnerID, reg.HeartbeatSecret) })
 		stop := maintainRunner(t, f.orch, reg, heartbeatPayload{RunnerID: reg.RunnerID, RunnerURL: f.upstream.url, Mode: "persistent", App: liveRunnerApp, Metadata: "gpu-discovery", Capacity: 2, Status: "ready", GPU: map[string]any{"name": "E2E GPU", "vram_mb": 24576}, PriceInfo: priceInfo{Price: "0.001", Currency: "usd", Unit: "fixed"}})
 		t.Cleanup(stop)
@@ -77,21 +74,21 @@ func runExtendedPayments(t *testing.T, f *paidFixture) {
 				requireStatus(t, "POST", s.AppURL, nil, 200)
 				// The same recipient submission must not buy another ten seconds.
 				status, body = httpJSON(t, "POST", endpoint, nil, j.headers())
-				require.GreaterOrEqual(t, status, 400, string(body))
+				requireRejection(t, status, body, 400, 403)
 				eventually(t, func() bool {
 					resp, err := testHTTPClient.Post(s.AppURL, "application/json", nil)
 					if err != nil {
 						return false
 					}
 					resp.Body.Close()
-					return resp.StatusCode >= 400
+					return resp.StatusCode == 404
 				}, envDuration(t, "E2E_LIVE_EXHAUSTION_TIMEOUT", "20s"), 200*time.Millisecond, "replayed tickets must not extend live credit")
 				requireRunnerCapacity(t, requireDiscoveredRunner(t, f.orch, j.route), 2, 0, 2)
 			})
 		}
 	})
 	t.Run("no tickets needed", func(t *testing.T) {
-		reg := registerRunnerHTTP(t, f.orch, heartbeatPayload{Label: "rounding-credit", RunnerURL: f.upstream.url, Mode: "persistent", App: liveRunnerApp, Capacity: 2, PriceInfo: priceInfo{Price: "0.000000000001", Currency: "usd", Unit: "fixed"}}, liveRunnerSecret)
+		reg := registerRunnerHTTP(t, f.orch, heartbeatPayload{RunnerURL: f.upstream.url, Mode: "persistent", App: liveRunnerApp, Capacity: 2, PriceInfo: priceInfo{Price: "0.000000000001", Currency: "usd", Unit: "fixed"}}, liveRunnerSecret)
 		t.Cleanup(func() { unregisterPaidRunner(t, f.orch, reg.RunnerID, reg.HeartbeatSecret) })
 		j := &paymentJob{signer: f.signer, orch: f.orch, route: reg.RunnerID, mode: "persistent", unit: "fixed", app: liveRunnerApp}
 		j.obtainChallenge(t)
@@ -151,10 +148,9 @@ func runExtendedPayments(t *testing.T, f *paidFixture) {
 					payment = protowire.AppendBytes(payment, ticket)
 				}
 				payment = replaceWire(t, payment, 1, protowire.BytesType, params)
-				before := f.upstream.calls.Load()
-				rejectPayment(t, j, payment)
-				require.Equal(t, before, f.upstream.calls.Load())
-				requireRunnerCapacity(t, requireDiscoveredRunner(t, f.orch, j.route), 2, 0, 2)
+				headers := j.headers()
+				headers["Livepeer-Payment"] = base64.StdEncoding.EncodeToString(payment)
+				f.rejectAdmission(t, j, headers)
 			})
 		}
 	})
@@ -164,35 +160,31 @@ func runExtendedPayments(t *testing.T, f *paidFixture) {
 		j := f.job(t, "fixed", "persistent")
 		j.obtainChallenge(t)
 		j.sign(t, nil)
-		payload, _ := json.Marshal(map[string]string{"prompt": "hello"})
 		var wg sync.WaitGroup
-		results := make(chan int, 8)
+		type result struct {
+			status int
+			body   []byte
+			err    error
+		}
+		results := make(chan result, 8)
 		for range 8 {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				req, _ := http.NewRequest("POST", j.target(), bytesReader(payload))
-				for k, v := range j.headers() {
-					req.Header.Set(k, v)
-				}
-				resp, err := testHTTPClient.Do(req)
-				if err != nil {
-					results <- 0
-					return
-				}
-				resp.Body.Close()
-				results <- resp.StatusCode
+				status, body, err := requestJSON("POST", j.target(), map[string]string{"prompt": "hello"}, j.headers())
+				results <- result{status, body, err}
 			}()
 		}
 		wg.Wait()
 		close(results)
 		accepted := 0
-		for code := range results {
-			require.NotZero(t, code)
+		for r := range results {
+			require.NoError(t, r.err)
+			code := r.status
 			if code == 200 {
 				accepted++
 			} else {
-				require.GreaterOrEqual(t, code, 400)
+				requireRejection(t, code, r.body, 400, 403, 409)
 			}
 		}
 		require.Equal(t, 1, accepted, "one paid admission for identical credentials")
@@ -200,7 +192,7 @@ func runExtendedPayments(t *testing.T, f *paidFixture) {
 		stopPaidSession(t, f.orch, j.route, j.challenge.ManifestID)
 	})
 	t.Run("nonce threshold and refresh continuation", func(t *testing.T) {
-		reg := registerRunnerHTTP(t, f.orch, heartbeatPayload{Label: "nonce-threshold", RunnerURL: f.upstream.url, App: liveRunnerApp, Mode: "persistent", Capacity: 2, PriceInfo: priceInfo{Price: "0.0198", Currency: "usd", Unit: "fixed"}}, liveRunnerSecret)
+		reg := registerRunnerHTTP(t, f.orch, heartbeatPayload{RunnerURL: f.upstream.url, App: liveRunnerApp, Mode: "persistent", Capacity: 2, PriceInfo: priceInfo{Price: "0.0198", Currency: "usd", Unit: "fixed"}}, liveRunnerSecret)
 		t.Cleanup(func() { unregisterPaidRunner(t, f.orch, reg.RunnerID, reg.HeartbeatSecret) })
 		j := &paymentJob{signer: f.signer, orch: f.orch, route: reg.RunnerID, mode: "persistent", unit: "fixed", app: liveRunnerApp}
 		j.obtainChallenge(t)
@@ -232,26 +224,21 @@ func runExtendedPayments(t *testing.T, f *paidFixture) {
 	})
 	t.Run("one signer identity per job", func(t *testing.T) {
 		j := f.job(t, "hour", "persistent")
+		account := f.chain.newAccount(t, true)
+		f.chain.fundPayer(t, account, ethAmount(t, "E2E_PAYER_DEPOSIT_ETH", "0.1"), ethAmount(t, "E2E_PAYER_RESERVE_ETH", "0.1"))
+		other := startSigner(t, signerOptions{backend: f.signer.backend, chain: f.chain, account: account, orch: f.orch})
 		j.obtainChallenge(t)
 		j.sign(t, nil)
 		s := j.submit(t)
 		defer stopPaidSession(t, f.orch, j.route, s.SessionID)
-		account := f.chain.newAccount(t, true)
-		f.chain.fundPayer(t, account, ethAmount(t, "E2E_PAYER_DEPOSIT_ETH", "0.1"), ethAmount(t, "E2E_PAYER_RESERVE_ETH", "0.1"))
-		other := startSigner(t, signerOptions{backend: f.signer.backend, chain: f.chain, account: account, orch: f.orch})
 		status, body := httpJSON(t, "POST", other.base+"/generate-live-payment", j.request(), nil)
-		require.GreaterOrEqual(t, status, 400, string(body))
-		assertNoCredentials(t, body)
+		requireRejection(t, status, body, 400)
 		// No cross-implementation handoff: a valid job stays with its original key.
 		j.sign(t, nil)
 		status, body = httpJSON(t, "POST", f.orch.httpBase+"/apps/"+j.route+"/session/"+s.SessionID+"/payment", nil, j.headers())
 		require.Equal(t, 200, status, string(body))
 		requireStatus(t, "POST", s.AppURL, nil, 200)
 	})
-	runFundingCases(t, f)
-	runWebhookCases(t, f)
-	runConfiguredCeilings(t, f)
-	runDistinctConcurrentPayments(t, f)
 }
 
 func runConfiguredCeilings(t *testing.T, f *paidFixture) {
@@ -308,22 +295,8 @@ func runDistinctConcurrentPayments(t *testing.T, f *paidFixture) {
 		results := make(chan result, len(jobs))
 		for _, j := range jobs {
 			go func(j *paymentJob) {
-				req, err := http.NewRequest("POST", j.target(), nil)
-				if err != nil {
-					results <- result{err: err}
-					return
-				}
-				for key, value := range j.headers() {
-					req.Header.Set(key, value)
-				}
-				resp, err := testHTTPClient.Do(req)
-				if err != nil {
-					results <- result{err: err}
-					return
-				}
-				body, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				results <- result{status: resp.StatusCode, body: body, err: err}
+				status, body, err := requestJSON("POST", j.target(), nil, j.headers())
+				results <- result{status, body, err}
 			}(j)
 		}
 		var sessions []string
@@ -366,14 +339,6 @@ func removeWire(t *testing.T, data []byte, field protowire.Number) []byte {
 	})
 	return out
 }
-func assertNoCredentials(t *testing.T, body []byte) {
-	t.Helper()
-	var p signedPayment
-	_ = json.Unmarshal(body, &p)
-	require.Empty(t, p.Payment)
-	require.Empty(t, p.Segment)
-}
-
 func runFundingCases(t *testing.T, f *paidFixture) {
 	for _, tc := range []struct {
 		name             string
@@ -404,8 +369,7 @@ func runFundingCases(t *testing.T, f *paidFixture) {
 			j.signer = s
 			j.obtainChallenge(t, f.payer.address)
 			status, body := j.generate(t, nil)
-			require.GreaterOrEqual(t, status, 400, string(body))
-			assertNoCredentials(t, body)
+			requireRejection(t, status, body, 400)
 			if tc.name == "withdrawing" {
 				f.chain.transact(t, a, "ticketBroker", f.chain.broker, "cancelUnlock", new(big.Int))
 			} else {
@@ -425,20 +389,6 @@ func runFundingCases(t *testing.T, f *paidFixture) {
 		})
 	}
 }
-func decimalWei(t *testing.T, s string) *big.Int {
-	r, ok := new(big.Rat).SetString(s)
-	require.True(t, ok)
-	r.Mul(r, new(big.Rat).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)))
-	require.True(t, r.IsInt())
-	return new(big.Int).Set(r.Num())
-}
-func senderEscrow(t *testing.T, c *chainFixture, a common.Address) (*big.Int, *big.Int, *big.Int) {
-	v := c.call(t, "ticketBroker", c.broker, "getSenderInfo", a)
-	sender := reflect.Indirect(reflect.ValueOf(v[0]))
-	reserve := reflect.Indirect(reflect.ValueOf(v[1]))
-	return sender.FieldByName("Deposit").Interface().(*big.Int), reserve.FieldByName("FundsRemaining").Interface().(*big.Int), sender.FieldByName("WithdrawRound").Interface().(*big.Int)
-}
-
 func runWebhookCases(t *testing.T, f *paidFixture) {
 	for _, name := range []string{"approval", "rejection", "unavailable", "malformed", "cached", "per-request", "identity change", "ceiling below", "ceiling equal", "ceiling above"} {
 		t.Run("webhook/"+name, func(t *testing.T) {
@@ -517,6 +467,3 @@ func runWebhookCases(t *testing.T, f *paidFixture) {
 		})
 	}
 }
-
-// Keep HTTP request goroutines independent of testing.Fatal/require calls.
-func bytesReader(data []byte) *bytes.Reader { return bytes.NewReader(data) }

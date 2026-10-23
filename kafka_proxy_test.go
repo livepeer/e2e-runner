@@ -67,7 +67,7 @@ func TestClearinghouseKafkaProxy(t *testing.T) {
 	raw := []byte(`{"id":"proxy-smoke","type":"proxy_smoke_test","timestamp":"1700000000000","data":{}}`)
 	require.NoError(t, writer.WriteMessages(ctx, kafka.Message{Key: []byte("proxy-smoke"), Value: raw}))
 	ch.waitUsage(t, "ignored", 1)
-	db := openReadDB(t, ch.db)
+	db := ch.readDB
 	var got []byte
 	require.NoError(t, db.QueryRow("SELECT raw_payload FROM usage_events WHERE status='ignored'").Scan(&got))
 	require.Equal(t, raw, got)

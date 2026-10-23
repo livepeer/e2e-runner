@@ -1,11 +1,8 @@
 package e2escope
 
 import (
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"math/big"
-	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,12 +115,8 @@ func runPriceRegistration(t *testing.T, f *paidFixture) {
 				name = "runtime valid price/" + unit
 			}
 			t.Run(name, func(t *testing.T) {
-				price := "0.001"
-				if unit == "hour" {
-					price = "3.6"
-				}
 				route := "valid-static-" + unit
-				cfg := staticRunnerConfig{Runners: []staticRunnerConfigEntry{{Label: route, Routing: "label", RunnerURL: f.upstream.url, HealthURL: f.upstream.url + "/health", App: liveRunnerApp, Mode: "persistent", Capacity: 2, Metadata: route, PriceInfo: priceInfo{Price: json.Number(price), Currency: "usd", Unit: unit}}}}
+				cfg := staticRunnerConfig{Runners: []staticRunnerConfigEntry{{Label: route, Routing: "label", RunnerURL: f.upstream.url, HealthURL: f.upstream.url + "/health", App: liveRunnerApp, Mode: "persistent", Capacity: 2, Metadata: route, PriceInfo: paidPrice(unit)}}}
 				orch := f.orch
 				if runtime {
 					registerStaticRunnerConfig(t, orch, cfg, 200)
@@ -186,14 +179,6 @@ func runPriceRegistration(t *testing.T, f *paidFixture) {
 		}
 	})
 	t.Run("SDK missing price", func(t *testing.T) {
-		runPythonRunnerMissingPrice(t, f.orch, liveRunnerSecret, f.upstream.url, "persistent", "missing-sdk")
+		runPythonRunnerMissingPrice(t, f.orch, liveRunnerSecret, f.upstream.url, "persistent")
 	})
-}
-
-func rejectPayment(t *testing.T, j *paymentJob, payment []byte) {
-	t.Helper()
-	headers := j.headers()
-	headers["Livepeer-Payment"] = base64.StdEncoding.EncodeToString(payment)
-	status, body := httpJSON(t, http.MethodPost, j.target(), nil, headers)
-	require.GreaterOrEqual(t, status, 400, fmt.Sprintf("invalid tickets admitted: %s", body))
 }

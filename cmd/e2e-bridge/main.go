@@ -226,18 +226,7 @@ func relay(tcp net.Conn, ws *websocket.Conn) {
 			}
 		}
 	}()
-	for {
-		typ, reader, err := ws.NextReader()
-		if err != nil {
-			break
-		}
-		if typ != websocket.BinaryMessage {
-			break
-		}
-		if _, err := io.Copy(tcp, reader); err != nil {
-			break
-		}
-	}
+	_, _ = io.Copy(tcp, &wsStream{ws: ws})
 	tcp.Close()
 	wg.Wait()
 }

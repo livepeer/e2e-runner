@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,9 +43,6 @@ var testHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 //go:embed testdata/python_runner_register.py
 var pythonRunnerRegisterScript string
-
-//go:embed testdata/python_runner_session_controls.py
-var pythonRunnerSessionControlsScript string
 
 //go:embed testdata/python_runner_missing_price.py
 var pythonRunnerMissingPriceScript string
@@ -81,7 +79,6 @@ type orchestratorOptions struct {
 type heartbeatPayload struct {
 	GPU       map[string]any `json:"gpu,omitempty"`
 	RunnerID  string         `json:"runner_id,omitempty"`
-	Label     string         `json:"label,omitempty"`
 	Proxy     bool           `json:"proxy,omitempty"`
 	RunnerURL string         `json:"runner_url"`
 	Version   string         `json:"version,omitempty"`
@@ -152,20 +149,6 @@ type proxyCreateResponse struct {
 	ProxyURL string `json:"proxy_url"`
 }
 
-type multiTrackMediaRoundTripResult struct {
-	ObservedVideoTracks  int                `json:"observed_video_tracks"`
-	ObservedAudioTracks  int                `json:"observed_audio_tracks"`
-	VideoFrameCounts     []int              `json:"video_frame_counts"`
-	AudioSampleCounts    []int              `json:"audio_sample_counts"`
-	VideoSignaturesOK    bool               `json:"video_signatures_ok"`
-	AudioFrequenciesOK   bool               `json:"audio_frequencies_ok"`
-	AudioFrequencyRatios map[string]float64 `json:"audio_frequency_ratios"`
-	SegmentsConsumed     int                `json:"segments_consumed"`
-	SegmentsStarted      int                `json:"segments_started"`
-	VerificationOK       bool               `json:"verification_ok"`
-	Errors               []string           `json:"errors"`
-}
-
 type proxiedTargetResponse struct {
 	Method      string `json:"method"`
 	Path        string `json:"path"`
@@ -180,7 +163,6 @@ type runnerConfig struct {
 	price     priceInfo
 	runnerURL string
 	mode      string
-	label     string
 	metadata  string
 	capacity  int
 	proxy     bool
@@ -259,11 +241,11 @@ func (pythonRunnerImplementation) Name() string {
 }
 
 func (pythonRunnerImplementation) Start(t *testing.T, ctx context.Context, orch *testOrchestrator, cfg runnerConfig) runnerRegistration {
-	return startPythonRunner(t, ctx, pythonRunnerRegisterScript, orch, cfg)
+	return startPythonRunner(t, ctx, false, orch, cfg)
 }
 
 func (pythonRunnerImplementation) StartSessionControlRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cfg runnerConfig) runnerRegistration {
-	return startPythonRunner(t, ctx, pythonRunnerSessionControlsScript, orch, cfg)
+	return startPythonRunner(t, ctx, true, orch, cfg)
 }
 
 func (goRunnerImplementation) Name() string {
@@ -411,7 +393,7 @@ func runDynamicRunnerScenario(t *testing.T, ctx context.Context, orch *testOrche
 
 func runRegisteredRunnerScenario(t *testing.T, orch *testOrchestrator, route string, cfg runnerConfig, upstream *runnerUpstream) {
 	t.Helper()
-	runner := requireDiscoveredRunnerByMetadata(t, orch, cfg.metadata)
+	runner := waitRunnerByMetadata(t, orch, cfg.metadata)
 	require.Equal(t, liveRunnerApp, runner.App)
 	require.Equal(t, cfg.metadata, runner.Metadata)
 	require.Equal(t, cfg.mode, runner.Mode)
@@ -541,7 +523,6 @@ func runDynamicRunnerProxyRegistration(t *testing.T) {
 					t.Run(mode+"/"+state, func(t *testing.T) {
 						cfg := runnerConfig{
 							mode:     mode,
-							label:    impl.Name() + "-" + mode + "-" + state,
 							metadata: fmt.Sprintf(`{"registration":"dynamic","implementation":%q,"mode":%q,"proxy":%t}`, impl.Name(), mode, proxy),
 							capacity: 2,
 							proxy:    proxy,
@@ -597,7 +578,6 @@ func newStaticRunnerMatrix(t *testing.T, prefix string) (staticRunnerConfig, []s
 			runnerCfg := runnerConfig{
 				runnerURL: upstream.server.URL,
 				mode:      mode,
-				label:     route,
 				metadata:  metadata,
 				capacity:  2,
 				proxy:     proxy,
@@ -741,7 +721,6 @@ func runRunnerSessionControlAPIs(t *testing.T) {
 		t.Run(impl.Name(), func(t *testing.T) {
 			cfg := runnerConfig{
 				mode:     liverunner.ModePersistent,
-				label:    impl.Name() + "-session-controls",
 				metadata: "session controls for " + impl.Name(),
 				capacity: 1,
 			}
@@ -893,53 +872,9 @@ func runMediaRoundTrip(t *testing.T, orch *testOrchestrator, signer *testSigner)
 		pythonMultiTrackMediaRoundTripScript,
 		publishURL,
 	)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
-		t.Fatalf(
-			"python multi-track media round-trip timed out\npython stderr:\n%s\norchestrator logs:\n%s",
-			stderr.String(),
-			readLog(t, orch.logPath),
-		)
-	}
-	require.NoError(
-		t,
-		err,
-		"python multi-track media round-trip failed\npython stderr:\n%s\norchestrator logs:\n%s",
-		stderr.String(),
-		readLog(t, orch.logPath),
-	)
-
-	var result multiTrackMediaRoundTripResult
-	require.NoError(
-		t,
-		json.Unmarshal([]byte(strings.TrimSpace(stdout.String())), &result),
-		"invalid helper output %q\npython stderr:\n%s\norchestrator logs:\n%s",
-		stdout.String(),
-		stderr.String(),
-		readLog(t, orch.logPath),
-	)
-	failureMessage := strings.Join(result.Errors, "; ")
-	require.Equal(t, 2, result.ObservedVideoTracks, failureMessage)
-	require.Equal(t, 2, result.ObservedAudioTracks, failureMessage)
-	require.Len(t, result.VideoFrameCounts, 2, failureMessage)
-	require.Len(t, result.AudioSampleCounts, 2, failureMessage)
-	for _, frameCount := range result.VideoFrameCounts {
-		require.Positive(t, frameCount, failureMessage)
-	}
-	for _, sampleCount := range result.AudioSampleCounts {
-		require.Positive(t, sampleCount, failureMessage)
-	}
-	require.True(t, result.VideoSignaturesOK, failureMessage)
-	require.True(t, result.AudioFrequenciesOK, failureMessage)
-	require.GreaterOrEqual(t, result.AudioFrequencyRatios["440"], 2.5, failureMessage)
-	require.GreaterOrEqual(t, result.AudioFrequencyRatios["880"], 2.5, failureMessage)
-	require.True(t, result.VerificationOK, failureMessage)
-	require.Positive(t, result.SegmentsConsumed)
-	require.Positive(t, result.SegmentsStarted)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Python media (context: %v): %s\n%s", ctx.Err(), output, readLog(t, orch.logPath))
+	t.Logf("Python media: %s", output)
 }
 
 func startOffchainOrchestrator(t *testing.T, optionList ...orchestratorOptions) *testOrchestrator {
@@ -952,27 +887,17 @@ func startOffchainOrchestrator(t *testing.T, optionList ...orchestratorOptions) 
 	return startOrchestrator(t, options)
 }
 
-func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *testOrchestrator, cfg runnerConfig) *pythonRunner {
+func startPythonRunner(t *testing.T, ctx context.Context, controls bool, orch *testOrchestrator, cfg runnerConfig) *pythonRunner {
 	t.Helper()
 	runCtx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
 	pythonRunnerDir := repoDir(t, envPythonRunnerDir)
 	port := fixturePort(t)
 	runnerURL := ""
-	if composeMode() && script == pythonRunnerSessionControlsScript {
+	if composeMode() && controls {
 		runnerURL = publicURL(t, "http://127.0.0.1:"+port)
 	}
-	cmd := fixtureCommand(t, runCtx, "python-runner", "uv", pythonRunnerDir, "run", "--frozen", "python", "-u", "-c", script,
-		orch.httpBase,
-		liveRunnerSecret,
-		cfg.runnerURL,
-		liveRunnerApp,
-		cfg.mode,
-		cfg.label,
-		fmt.Sprintf("%d", cfg.capacity),
-		cfg.metadata,
-		fmt.Sprintf("%t", cfg.proxy),
-		string(runnerPrice(cfg).Price), runnerPrice(cfg).Unit, port, runnerURL,
-	)
+	cmd := fixtureCommand(t, runCtx, "python-runner", "uv", pythonRunnerDir, "run", "--frozen", "python", "-u", "-c", pythonRunnerRegisterScript)
 	stdin, err := cmd.StdinPipe()
 	require.NoError(t, err)
 	stdout, err := cmd.StdoutPipe()
@@ -986,6 +911,18 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 		done <- cmd.Wait()
 		close(done)
 	}()
+
+	runner := &pythonRunner{stdin: stdin, cancel: cancel, done: done, stderr: stderr}
+	t.Cleanup(func() { runner.Close(t) })
+	price := runnerPrice(cfg)
+	portNumber, err := strconv.Atoi(port)
+	require.NoError(t, err)
+	require.NoError(t, json.NewEncoder(stdin).Encode(map[string]any{
+		"runner_url": cfg.runnerURL, "port": portNumber, "public_url": runnerURL, "controls": controls,
+		"registration": map[string]any{"orchestrator_url": orch.httpBase, "secret": liveRunnerSecret,
+			"app": liveRunnerApp, "mode": cfg.mode, "proxy": cfg.proxy, "capacity": cfg.capacity,
+			"metadata": cfg.metadata, "price": price.Price, "currency": "usd", "unit": price.Unit},
+	}))
 
 	type lineResult struct {
 		line string
@@ -1003,8 +940,6 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 		require.NoError(t, result.err, stderr.String())
 		line = result.line
 	case <-time.After(envDuration(t, "E2E_READY_TIMEOUT", "30s")):
-		cancel()
-		<-done
 		t.Fatalf("timed out waiting for python-runner registration: %s", stderr.String())
 	}
 
@@ -1018,17 +953,7 @@ func startPythonRunner(t *testing.T, ctx context.Context, script string, orch *t
 	require.Equal(t, orch.httpBase, meta.OrchestratorURL)
 	require.NotZero(t, meta.HeartbeatS)
 
-	runner := &pythonRunner{
-		runnerID:        meta.RunnerID,
-		orchestratorURL: meta.OrchestratorURL,
-		stdin:           stdin,
-		cancel:          cancel,
-		done:            done,
-		stderr:          stderr,
-	}
-	t.Cleanup(func() {
-		runner.Close(t)
-	})
+	runner.runnerID, runner.orchestratorURL = meta.RunnerID, meta.OrchestratorURL
 	return runner
 }
 
@@ -1063,7 +988,7 @@ func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cf
 	return runner
 }
 
-func runPythonRunnerMissingPrice(t *testing.T, orch *testOrchestrator, secret, runnerURL, mode, label string) {
+func runPythonRunnerMissingPrice(t *testing.T, orch *testOrchestrator, secret, runnerURL, mode string) {
 	t.Helper()
 	pythonRunnerDir := repoDir(t, envPythonRunnerDir)
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration(t, "E2E_JOB_TIMEOUT", "30s"))
@@ -1074,7 +999,6 @@ func runPythonRunnerMissingPrice(t *testing.T, orch *testOrchestrator, secret, r
 		runnerURL,
 		liveRunnerApp,
 		mode,
-		label,
 	)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
@@ -1096,6 +1020,7 @@ func (r *pythonRunner) Close(t *testing.T) {
 	if r.stdin == nil {
 		return
 	}
+	defer r.cancel()
 	_ = r.stdin.Close()
 	r.stdin = nil
 	select {

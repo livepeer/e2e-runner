@@ -56,7 +56,7 @@ func runPaidLifecycle(t *testing.T, f *paidFixture) {
 				}
 			}()
 			if opts.staticConfigPath == "" {
-				payload := heartbeatPayload{Label: route, RunnerURL: upstream.URL, App: liveRunnerApp, Mode: "persistent", Capacity: 2, Proxy: true, Status: "ready", Metadata: route, PriceInfo: priceInfo{Price: "3.6", Currency: "usd", Unit: "hour"}}
+				payload := heartbeatPayload{RunnerURL: upstream.URL, App: liveRunnerApp, Mode: "persistent", Capacity: 2, Proxy: true, Status: "ready", Metadata: route, PriceInfo: priceInfo{Price: "3.6", Currency: "usd", Unit: "hour"}}
 				reg = registerRunnerHTTP(t, orch, payload, liveRunnerSecret)
 				route = reg.RunnerID
 				payload.RunnerID = route
