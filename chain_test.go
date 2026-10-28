@@ -680,7 +680,11 @@ func (c *chainFixture) roundTransaction(t *testing.T, a *chainAccount, method st
 		// Only retry a known round-boundary rejection. Other CLI errors remain
 		// failures, and a confirmed workflow is never replayed.
 		locked := c.call(t, "roundsManager", c.rounds, "currentRoundLocked")[0].(bool)
-		if !locked && !strings.Contains(string(output), "round") {
+		initialized := c.call(t, "roundsManager", c.rounds, "currentRoundInitialized")[0].(bool)
+		// Node redacts RPC revert text. An uninitialized round after the
+		// preflight, together with a failed simulation, also proves this race.
+		uninitialized := !initialized && strings.Contains(string(output), "transaction simulation failed")
+		if !locked && !uninitialized && !strings.Contains(string(output), "round") {
 			t.Fatalf("Node CLI %s: %v\n%s", method, err, output)
 		}
 		t.Logf("round-boundary CLI retry %s: %v", method, err)

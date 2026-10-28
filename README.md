@@ -35,6 +35,16 @@ E2E_ORCHESTRATORS=node E2E_SIGNERS=node \
 
 The Go runner SDK version is pinned in [go.mod](go.mod). The Python integration uses the checkout selected by `PYTHON_RUNNER_DIR`; streaming coverage requires `StreamPayload` and the `on_payment_session` callback. The harness records source revisions and working-tree fingerprints in its [run artifacts](#run-artifacts).
 
+`TestOnchainRedemptionConcurrency` exercises independent processes sharing a redemption wallet and separate databases: Node/Node, Node/go-livepeer in both collision orders, go-livepeer/go-livepeer, and two Nodes with go-livepeer. It also checks external nonce consumption, lost submission replies across restart, replacements and their limit, nonce-gap repair, duplicate tickets, and subsequent work. Its RPC barriers hold genuine nonce responses; transactions and receipts come from the configured chain.
+
+```sh
+go test -race -count=1 -timeout 30m -v -run '^TestOnchainRedemptionConcurrency$' .
+go test -race -count=3 -timeout 30m -v \
+  -run '^TestOnchainRedemptionConcurrency$/collision/go-livepeer\+go-livepeer$' .
+```
+
+Run this suite alone against a disposable chain: it probes mining controls and pauses mining for replacement tests. Missing capabilities appear as `INFRASTRUCTURE` skips with recorded reasons. Node submission requires actual finalized headers and account state at their canonical block hashes; the default devnet cannot provide them. The `unsupported_finality/node` case checks that a real Node worker retains its ticket without broadcasting. Finalized state is never substituted with `latest`. Eviction-dependent gap tests also require `txpool_dropTransaction`. Every run saves source/binary provenance and JSON summaries of nonce reads, submissions, and database states under `E2E_ARTIFACT_DIR` (default `artifacts`). The suite uses one ticket per job and a fixed gas allowance to isolate forced submission delays from gas-estimation changes.
+
 Run chain-changing suites serially; do not launch payment and accounting suites concurrently against the same chain. Go's slash-separated `-run` expressions select an orchestrator, signer, wallet mode, and case. For example, `-run '^TestOnchainPayments/go-livepeer/go-livepeer/split-wallet/challenge_and_admission$'` selects one payment case. Use `-run '^TestOnchainPayments/[^/]+/[^/]+/same-wallet$'` or `-run '^TestOnchainPayments/[^/]+/[^/]+/split-wallet$'` to select a wallet mode across all pairings.
 
 ## Docker Compose mode

@@ -30,7 +30,15 @@ type rpcFaults struct {
 	highFee       atomic.Bool
 }
 
-func faultRPC(t *testing.T, c *chainFixture) *rpcFaults {
+type rpcRequest struct {
+	Method string
+	ID     json.RawMessage
+	Params []json.RawMessage
+}
+
+type rpcHook func(http.ResponseWriter, *http.Request, rpcRequest) bool
+
+func faultRPC(t *testing.T, c *chainFixture, hooks ...rpcHook) *rpcFaults {
 	t.Helper()
 	target, err := url.Parse(c.url)
 	require.NoError(t, err)
@@ -47,12 +55,13 @@ func faultRPC(t *testing.T, c *chainFixture) *rpcFaults {
 			return
 		}
 		r.Body = io.NopCloser(strings.NewReader(string(data)))
-		var request struct {
-			Method string
-			ID     json.RawMessage
-			Params []json.RawMessage
-		}
+		var request rpcRequest
 		_ = json.Unmarshal(data, &request)
+		for _, hook := range hooks {
+			if hook(w, r, request) {
+				return
+			}
+		}
 		if fault.receiptsDown.Load() && request.Method == "eth_getTransactionReceipt" {
 			respondJSON(t, w, map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": nil})
 			return
@@ -132,11 +141,14 @@ func observedWinning(t *testing.T, orch *testOrchestrator, payer common.Address)
 	aux := append(common.LeftPadBytes(big.NewInt(round).Bytes(), 32), common.HexToHash(roundHash).Bytes()...)
 	return &observedTicket{Recipient: common.HexToAddress(recipient), Sender: common.HexToAddress(sender), FaceValue: new(big.Int).SetBytes(face), WinProb: new(big.Int).SetBytes(prob), SenderNonce: big.NewInt(nonce), RecipientRandHash: common.HexToHash(hash), AuxData: aux, Signature: sig, Random: new(big.Int).SetBytes(rand), Expiry: expiry, Tx: common.HexToHash(tx)}
 }
-func makeWinning(t *testing.T, f *paidFixture, headers map[string]string) *observedTicket {
+func makeWinning(t *testing.T, f *paidFixture, headers map[string]string, beforeSign ...func(*paymentJob)) *observedTicket {
 	t.Helper()
 	for range 16 {
 		j := f.job(t, "fixed", "persistent")
 		j.obtainChallenge(t)
+		for _, prepare := range beforeSign {
+			prepare(j)
+		}
 		j.sign(t, headers)
 		s := j.submit(t)
 		stopPaidSession(t, f.orch, j.route, s.SessionID)
@@ -164,6 +176,12 @@ func waitSettlement(t *testing.T, f *paidFixture, ticket *observedTicket) *types
 		err := f.chain.rpc.CallContext(ctx, &receipt, "eth_getTransactionReceipt", latest.Tx)
 		return err == nil && receipt != nil
 	}, envDuration(t, "E2E_REDEMPTION_TIMEOUT", "90s"), 300*time.Millisecond, "redemption receipt: %s", readLog(t, f.orch.logPath))
+	verifySettlement(t, f, ticket, receipt)
+	return receipt
+}
+
+func verifySettlement(t *testing.T, f *paidFixture, ticket *observedTicket, receipt *types.Receipt) {
+	t.Helper()
 	require.Equal(t, uint64(1), receipt.Status)
 	require.Greater(t, receipt.BlockNumber.Uint64(), ticket.Expiry, "randomness revealed after ticket acceptance window")
 	tx, err := f.chain.rpcTransaction(t, receipt.TxHash)
@@ -193,7 +211,6 @@ func waitSettlement(t *testing.T, f *paidFixture, ticket *observedTicket) *types
 		}
 	}
 	require.True(t, matched, "receipt must redeem the observed winning ticket")
-	return receipt
 }
 
 func TestOnchainRecovery(t *testing.T) {
