@@ -3,11 +3,10 @@ set -euo pipefail
 umask 022
 cd /tmp/payment-perf
 mkdir -p sources bin results
-test -d sources/node-current/.git || git clone /tmp/payment-perf/node.bundle sources/node-current
+test -d sources/node-current/.git || git clone --filter=blob:none --no-checkout https://github.com/livepeer/node.git sources/node-current
+git -C sources/node-current fetch --depth=1 origin e2b331958a5704016310153a7d33b7a634758f38
 git -C sources/node-current checkout --detach e2b331958a5704016310153a7d33b7a634758f38
-test -d sources/node-pr1/.git || git clone /tmp/payment-perf/node.bundle sources/node-pr1
-git -C sources/node-pr1 checkout --detach bbe126e5eddbf59f9cc9f94d3c37703215c26850
-test -d sources/node-combined/.git || git clone /tmp/payment-perf/node.bundle sources/node-combined
+PERF_ROOT=/tmp/payment-perf python3 scope/performance/targets.py prepare
 test -d sources/go-livepeer/.git || git clone --filter=blob:none --no-checkout https://github.com/livepeer/go-livepeer.git sources/go-livepeer
 git -C sources/go-livepeer fetch --depth=1 origin 2a4f7c48239a3b3e6ce49ca793a41253ec664b26
 git -C sources/go-livepeer checkout --detach FETCH_HEAD

@@ -10,8 +10,20 @@ import subprocess
 import sys
 import time
 
+import targets
+
 ROOT = Path(os.environ.get("PERF_ROOT", "/work"))
-TARGETS = ["node-current", "node-pr1", "node-combined", "go-livepeer"]
+
+
+def definition(name):
+    return next(t for t in targets.read(ROOT) if t["name"] == name)
+
+
+def binaries(target):
+    binary = ROOT / "bin" / target["name"]
+    if target["backend"] == "node":
+        return [binary / component for component in ["livepeer", "livepeer-orchestrator", "livepeer-signer", "livepeer-chain"]]
+    return [binary, ROOT / "bin/livepeer_cli"] if target["backend"] == "go-livepeer" else []
 
 
 def command(argv, **kwargs):
@@ -19,33 +31,32 @@ def command(argv, **kwargs):
 
 
 def manifest():
+    frozen = json.loads((ROOT / "manifest.json").read_text())
     sources = {}
-    for name in TARGETS + ["protocol"]:
+    for target in frozen["targets"] + [{"name": "protocol", "backend": "protocol", "repository": "https://github.com/livepeer/protocol.git"}]:
+        name = target["name"]
         source = ROOT / "sources" / name
         git = lambda *args: subprocess.check_output(["git", "-c", "safe.directory=" + str(source), "-C", str(source), *args], text=True).strip()
-        binary = ROOT / "bin" / name
-        if name.startswith("node-"):
-            binary /= "livepeer"
-        binaries = [ROOT / "bin" / name / component for component in ["livepeer", "livepeer-orchestrator", "livepeer-signer", "livepeer-chain"]] if name.startswith("node-") else [binary]
-        if name == "go-livepeer":
-            binaries.append(ROOT / "bin/livepeer_cli")
-        sources[name] = {"revision": git("rev-parse", "HEAD"), "status": git("status", "--porcelain"),
-                         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None,
-                         "binaries_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in binaries if p.is_file()},
+        executables = binaries(target)
+        revision = git("rev-parse", "HEAD")
+        if target.get("revision", revision) != revision:
+            raise SystemExit("Source differs from the frozen target: " + name)
+        sources[name] = target | {"revision": revision, "status": git("status", "--porcelain"),
+                         "binary_sha256": hashlib.sha256(executables[0].read_bytes()).hexdigest() if executables else None,
+                         "binaries_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in executables},
                          "binary_go_versions": {str(p.relative_to(ROOT)): subprocess.check_output(["go", "version", str(p)], text=True).strip().split()[-1]
-                                                for p in binaries if p.is_file()}}
-    result = {"sources": sources, "platform": platform.platform(), "cpu_count": os.cpu_count(),
+                                                for p in executables}}
+    result = frozen | {"sources": sources, "platform": platform.platform(), "cpu_count": os.cpu_count(),
               "go_toolchain": subprocess.check_output(["go","version"],text=True).strip(),
               "ffmpeg_version": subprocess.check_output(["ffmpeg","-version"],text=True).splitlines()[0],
               "ffmpeg_git_commit": "d9751c73e714b01b363483db358b1ea8022c9bea",
               "harness_binary_sha256": hashlib.sha256((ROOT / "bin/scope.test").read_bytes()).hexdigest(),
               "harness_go_sources_sha256": {str(p.relative_to(ROOT / "scope")): hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT / "scope").rglob("*.go")},
               "harness_inputs_sha256": {name: hashlib.sha256((ROOT / "scope" / name).read_bytes()).hexdigest()
-                                        for name in ["go.mod", "go.sum", "test.env", "testdata/contracts.json", "performance/run.py", "performance/controlled.py", "performance/controlled_test.go.txt"]},
+                                        for name in ["go.mod", "go.sum", "test.env", "testdata/contracts.json", "performance/run.py", "performance/targets.py", "performance/controlled.py", "performance/controlled_test.go.txt"]},
               "clock_ticks_per_second": os.sysconf("SC_CLK_TCK"), "created_at": time.time(),
               "load_model": "closed-loop; no think time; independent manifests",
-              "protocol_test_parameters": {"unlock_period_rounds": 2, "block_time_seconds": 1, "slots_per_epoch": 1},
-              "combined_review_complete": False}
+              "protocol_test_parameters": {"unlock_period_rounds": 2, "block_time_seconds": 1, "slots_per_epoch": 1}}
     cpuinfo = Path("/proc/cpuinfo")
     if cpuinfo.is_file():
         result["cpu_model"] = next((line.split(":", 1)[1].strip() for line in cpuinfo.read_text().splitlines() if line.startswith("model name")), "unknown")
@@ -56,7 +67,7 @@ def manifest():
 
 
 def environment(target, result):
-    backend = "go-livepeer" if target == "go-livepeer" else "node"
+    backend = definition(target)["backend"]
     node = "node-current" if backend == "go-livepeer" else target
     controller = json.loads((ROOT / "sources/protocol/deployments/gethDev/Controller.json").read_text())["address"]
     maximum = (1 << 256) - 1
@@ -74,24 +85,34 @@ def environment(target, result):
         "E2E_CHAIN_REALTIME": "true", "E2E_BLOCK_TIMEOUT": "5m",
         "E2E_PERF_REVISION": subprocess.check_output(["git","-c","safe.directory="+str(ROOT/"sources"/target),"-C",str(ROOT/"sources"/target),"rev-parse","HEAD"],text=True).strip(),
     }
-    env["GIT_CONFIG_COUNT"] = str(len(TARGETS))
-    for i,name in enumerate(TARGETS):
+    names = [t["name"] for t in targets.read(ROOT)]
+    env["GIT_CONFIG_COUNT"] = str(len(names))
+    for i,name in enumerate(names):
         env[f"GIT_CONFIG_KEY_{i}"] = "safe.directory"
         env[f"GIT_CONFIG_VALUE_{i}"] = str(ROOT / "sources" / name)
     return env
 
 
-def run_test(target, label, pattern, settings=None):
+def run_test(target, label, pattern, settings=None, resume=False):
     result = ROOT / "results" / target / label
     result.mkdir(parents=True, exist_ok=True)
     env = environment(target, result) | (settings or {})
+    identity = {"revision": env["E2E_PERF_REVISION"], "pattern": pattern, "settings": settings or {},
+                "binaries_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in binaries(definition(target))},
+                "harness_sha256": hashlib.sha256((ROOT / "bin/scope.test").read_bytes()).hexdigest()}
+    status_path = result / "exit.json"
+    if resume and status_path.is_file():
+        previous = json.loads(status_path.read_text())
+        if previous.get("identity") != identity:
+            raise SystemExit("Refusing to reuse results with different inputs: " + str(result) + "; use a fresh results directory")
+        return previous["exit_code"]
     start = time.time()
     with (result / "test.log").open("w") as out:
         completed = subprocess.run([str(ROOT / "bin/scope.test"), "-test.v", "-test.count=1", "-test.timeout=30m", "-test.run=" + pattern],
                                    cwd=ROOT / "scope", env=env, stdout=out, stderr=subprocess.STDOUT, timeout=1900)
     status = {"target": target, "label": label, "pattern": pattern, "exit_code": completed.returncode,
               "started_at": start, "finished_at": time.time(), "elapsed_seconds": time.time() - start,
-              "settings": settings or {}, "source_revision": env["E2E_PERF_REVISION"]}
+              "settings": settings or {}, "source_revision": env["E2E_PERF_REVISION"], "identity": identity}
     (result / "exit.json").write_text(json.dumps(status, indent=2) + "\n")
     print(json.dumps(status), flush=True)
     return completed.returncode
@@ -99,24 +120,25 @@ def run_test(target, label, pattern, settings=None):
 
 def matrix(args):
     selected = args.targets.split(",")
-    frozen = json.loads((ROOT / "manifest.json").read_text())
-    if "node-combined" in selected and not frozen["combined_review_complete"] and not args.provisional_combined:
-        raise SystemExit("Final combined review must be recorded before measuring that target")
+    plan = {"targets": selected, "repetitions": 1 if args.quick else 3, "delays_ms": [0, 110], "workers": [1, 32]}
+    plan["expected_cells"] = len(selected) * plan["repetitions"] * len(plan["delays_ms"]) * len(plan["workers"])
+    plan_path = ROOT / "results" / ("pilot-matrix.json" if args.quick else "matrix.json")
+    if plan_path.exists() and json.loads(plan_path.read_text()) != plan:
+        raise SystemExit("Matrix selection changed; use a fresh results directory")
+    plan_path.write_text(json.dumps(plan, indent=2) + "\n")
     shared = {"E2E_PERF_RECIPIENT_DIR": str(ROOT / "private/performance-recipient")}
     if run_test(selected[0], "prepare-recipient", "^TestPerformancePrepareRecipient$", shared):
         raise SystemExit("Shared performance recipient setup failed")
-    for repeat in range(1 if args.quick else 3):
+    for repeat in range(plan["repetitions"]):
         ordered = selected[repeat % len(selected):] + selected[:repeat % len(selected)]
         for delay in [0, 110]:
             for workers in [1, 32]:
                 for target in ordered:
                     label = ("pilot-" if args.quick else "") + f"delay-{delay}-workers-{workers}-repeat-{repeat}"
-                    if (ROOT / "results" / target / label / "exit.json").is_file():
-                        continue
                     run_test(target, label, "^TestPaymentPerformance$", shared | {
                         "E2E_PERF_WORKERS": str(workers), "E2E_PERF_SAMPLES": str((8 if workers == 1 else 64) if args.quick else (128 if workers == 1 else 1024)),
                         "E2E_PERF_DELAY": f"{delay}ms", "E2E_PERF_REPETITION": str(repeat),
-                        "E2E_PERF_IDLE": "60s" if not args.quick and repeat == 0 and workers == 1 else "0s"})
+                        "E2E_PERF_IDLE": "60s" if not args.quick and repeat == 0 and workers == 1 else "0s"}, resume=True)
 
 
 def correctness(args):
@@ -136,7 +158,7 @@ def correctness(args):
     settings = {"E2E_TICKET_FACE_VALUE": "400000000000", "E2E_TICKET_WIN_PROB": str(((1 << 256) - 1) // 2), "E2E_TICKET_EV": "200000000000"}
     recovery = settings | {"E2E_TICKET_FACE_VALUE":"1000000000000000", "E2E_TICKET_EV":"500000000000000", "E2E_SIGNER_MAX_TICKET_EV":"3000000000000000", "E2E_SIGNER_MAX_BATCH_EV":"20000000000000000"}
     for target in args.targets.split(","):
-        backend = "go-livepeer" if target == "go-livepeer" else "node"
+        backend = definition(target)["backend"]
         if run_test(target, "prerequisites", "^TestPerformanceChainPrerequisites$"):
             raise SystemExit("Disposable chain prerequisites failed for " + target)
         if target == "go-livepeer":
@@ -164,13 +186,18 @@ def validate(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["manifest", "matrix", "correctness", "validate", "smoke"])
-    parser.add_argument("--targets", default=",".join(TARGETS))
+    parser.add_argument("--targets", help="Comma-separated subset of configured targets (default: driver selection)")
     parser.add_argument("--quick", action="store_true", help="Small pilot cells, excluded from the formal report")
     parser.add_argument("--recovery-only", action="store_true", help="For correctness, rerun only recovery cases")
-    parser.add_argument("--provisional-combined", action="store_true", help="Measure a pinned snapshot while its final review is pending")
     args = parser.parse_args()
-    if not args.targets or not set(args.targets.split(",")) <= set(TARGETS):
-        parser.error("targets must be a comma-separated subset of " + ",".join(TARGETS))
+    frozen = json.loads((ROOT / "manifest.json").read_text())
+    selection = args.targets
+    if selection is None and "selected_targets" in frozen:
+        selection = ",".join(frozen["selected_targets"])
+    try:
+        args.targets = ",".join(targets.select(frozen["targets"], selection))
+    except ValueError as error:
+        parser.error(str(error))
     if args.action == "manifest":
         manifest()
     elif args.action == "matrix":

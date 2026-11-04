@@ -6,6 +6,7 @@ import math
 import re
 from pathlib import Path
 import sys
+from urllib.parse import urlsplit
 
 HISTORICAL_RUNS = {
     "controlled-adapter-initial": ("adapter_error", "The overlay used SenderInfo after the combined stack renamed that adapter to PayerFunds; the corrected overlay was rerun."),
@@ -16,6 +17,17 @@ HISTORICAL_RUNS = {
 
 def quantile(values, q):
     return sorted(values)[max(0, math.ceil(len(values) * q) - 1)] if values else None
+
+
+def commit_link(info):
+    revision = info["revision"]
+    repository = info.get("repository", "")
+    if repository.startswith("git@github.com:"):
+        repository = "https://github.com/" + repository.split(":", 1)[1]
+    parsed = urlsplit(repository)
+    if parsed.hostname == "github.com":
+        return f'[`{revision}`](https://github.com{parsed.path.removesuffix(".git")}/commit/{revision})'
+    return f'`{revision}`'
 
 
 def summarize(root):
@@ -51,16 +63,20 @@ def write_report(root, rows):
     manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
     lines = ["# Payment-path comparison", "", "Measured with real signer/orchestrator processes and a minimal echo runner on one disposable GCP VM. RPC delay is added once per HTTP exchange, including batches. These results do not measure GPU inference or Internet gateway latency.", "", "## Pinned inputs", "", "| Target | Commit | Embedded Go toolchain |", "|---|---|---|"]
     for name, info in manifest.get("sources", {}).items():
-        repo = {"go-livepeer": "livepeer/go-livepeer", "protocol": "livepeer/protocol", "node-pr1": "BlueClawNetwork/livepeer-node"}.get(name, "livepeer/node")
         versions = ", ".join(sorted(set(info.get("binary_go_versions", {}).values()))) or "—"
-        lines.append(f'| {name} | [`{info["revision"]}`](https://github.com/{repo}/commit/{info["revision"]}) | {versions} |')
-    lines += ["", "Reference: [builder issue 89](https://github.com/NE-Build-Track/livepeer-builder-core/issues/89), [BlueClaw PR 1](https://github.com/BlueClawNetwork/livepeer-node/pull/1)."]
+        lines.append(f'| {name} | {commit_link(info)} | {versions} |')
+    lines += ["", "Reference: [builder issue 89](https://github.com/NE-Build-Track/livepeer-builder-core/issues/89)."]
     lines += ["", "Each project's declared Go toolchain requirements are respected. The manifest records the toolchain embedded in every measured binary, separately from the runtime image's default Go version."]
-    if not manifest.get("combined_review_complete",False):
+    if manifest.get("combined_review_complete") is False:
         lines += ["", "**Provisional combined snapshot:** the source chat's final combined review was still pending when this revision was frozen. Results identify the exact tested commit and must not be treated as final-review approval."]
     if manifest.get("final_candidate_measured_after_baselines"):
         lines += ["", "The reviewed combined revision was measured after the frozen baseline matrix on the same VM. Baseline product binaries, payment-path instrumentation, provider-delay model, and recipient stayed unchanged. `manifest-provisional-timing.json` retains the baseline harness provenance. This ordering is a limitation when interpreting small differences between cached implementations."]
-    lines += ["", "## Performance", "", f"{len(rows)}/48 formal cells produced measurement records. Each completed row should pool three repetitions; `aggregates.json` records the actual repetition counts and revisions. Dispatch latency includes the unpaid challenge, signing, paid request, and arrival at the runner. The load model is closed loop with 1 or 32 clients. Errors remain in attempted counts and goodput excludes them.", "", "| Target | RPC delay | Clients | Successful / attempted | Dispatch p50 / p95 / p99 ms | Success/s | Loaded worker exchanges / attempt |", "|---|---:|---:|---:|---:|---:|---:|"]
+    matrix_path = root / "matrix.json"
+    matrix = json.loads(matrix_path.read_text()) if matrix_path.is_file() else {}
+    names = manifest.get("selected_targets") or [name for name in manifest.get("sources", {}) if name != "protocol"] or sorted({r["target"] for r in rows})
+    expected = matrix.get("expected_cells", len(names) * 12)
+    repetitions = matrix.get("repetitions", 3)
+    lines += ["", "## Performance", "", f"{len(rows)}/{expected} formal cells produced measurement records. Each completed row should pool {repetitions} repetitions; `aggregates.json` records the actual repetition counts and revisions. Dispatch latency includes the unpaid challenge, signing, paid request, and arrival at the runner. The load model is closed loop with 1 or 32 clients. Errors remain in attempted counts and goodput excludes them.", "", "| Target | RPC delay | Clients | Successful / attempted | Dispatch p50 / p95 / p99 ms | Success/s | Loaded worker exchanges / attempt |", "|---|---:|---:|---:|---:|---:|---:|"]
     groups = collections.defaultdict(list)
     for row in rows:
         groups[(row["target"], row["delay_ms"], row["workers"])].append(row)
@@ -126,14 +142,13 @@ def write_report(root, rows):
         count = sum(c["samples"] for c in cells)
         peaks = [max(c["resources"]["processes"][i]["sampled_peak_rss_bytes"] for c in cells)/1048576 for i in range(2)]
         lines.append(f'| {target} | {delay:g} ms | {workers} | {cpu/count:.3f} | {peaks[0]:.1f} / {peaks[1]:.1f} |')
-    lines += ["", "### Combined stack against each baseline", "", "| Baseline | RPC delay | Clients | Combined / baseline median dispatch | Median reduction |", "|---|---:|---:|---:|---:|"]
+    lines += ["", "### Pairwise comparisons", "", "Each measured build is compared against every other measured build at the same delay and client count.", "", "| Target | Baseline | RPC delay | Clients | Target / baseline median dispatch | Median reduction |", "|---|---|---:|---:|---:|---:|"]
     for (target,delay,workers), result in sorted(aggregates.items()):
-        if target == "node-combined":
-            continue
-        combined = aggregates.get(("node-combined",delay,workers))
-        if combined and result["p50"] and combined["p50"] is not None:
-            ratio = combined["p50"]/result["p50"]
-            lines.append(f'| {target} | {delay:g} ms | {workers} | {ratio:.4f}× | {(1-ratio)*100:.2f}% |')
+        for baseline in names:
+            reference = aggregates.get((baseline, delay, workers))
+            if target != baseline and reference and reference["p50"] and result["p50"] is not None:
+                ratio = result["p50"] / reference["p50"]
+                lines.append(f'| {target} | {baseline} | {delay:g} ms | {workers} | {ratio:.4f}× | {(1-ratio)*100:.2f}% |')
     lines += ["", "Ratios describe observed medians, not statistical confidence bounds. Per-repetition medians are retained in `aggregates.json`; small differences between cached implementations should be interpreted with that run-to-run variability."]
     lines += ["", "### Cold requests and startup", "", "Each cell uses fresh worker processes, payer, and databases. The recipient is shared and already active. Cold rows are the first request after registration; background observation can already run during startup and the optional 60-second pre-job idle. Startup uses the local provider without injected delay and measures HTTP readiness, not full payment readiness.", "", "| Target | RPC delay | Clients | Cold successes / attempts | Cold dispatch p50 ms | Orchestrator / signer HTTP ready p50 s |", "|---|---:|---:|---:|---:|---:|"]
     for (target, delay, workers), cells in sorted(groups.items()):
@@ -148,7 +163,7 @@ def write_report(root, rows):
         for name in ["idle-before-first-job", "idle-known"]:
             rpc = cell["rpc"].get(name, {})
             lines.append(f'| {cell["target"]} | {cell["delay_ms"]:g} ms | {name} | {rpc.get("exchanges", 0)/cell["idle_seconds"]:.3f} | {rpc.get("calls", 0)/cell["idle_seconds"]:.3f} |')
-    lines += ["", "## Correctness and validation", "", "Nonzero current-suite exits remain findings; they do not remove a candidate from the comparison. Earlier fixture or adapter failures are retained separately. Controlled overlays run the same scenarios against each Node revision and retain the fixture and overlay hashes.", "", "| Target | Suite | Exit status | Classification |", "|---|---|---:|---|"]
+    lines += ["", "## Correctness and validation", "", "Nonzero current-suite exits remain findings; they do not remove a candidate from the comparison. Earlier fixture or adapter failures are retained separately. Controlled overlays require an external fixture and supported source APIs; executed suites retain the fixture and overlay hashes, and skipped suites are labeled explicitly.", "", "| Target | Suite | Exit status | Classification |", "|---|---|---:|---|"]
     failures, controlled, historical = [], [], []
     for path in sorted(root.glob("*/*/exit.json")):
         if path.parent.name.startswith("pilot-") or path.parent.name == "prepare-recipient":
@@ -162,7 +177,11 @@ def write_report(root, rows):
         if classification != "current":
             historical.append({"target": path.parent.parent.name, "suite": path.parent.name, **status})
             continue
-        lines.append(f'| {path.parent.parent.name} | {path.parent.name} | {status["exit_code"]} | {classification} |')
+        exit_status = "skipped" if status.get("skipped") else status["exit_code"]
+        reason = status.get("reason", classification)
+        lines.append(f'| {path.parent.parent.name} | {path.parent.name} | {exit_status} | {reason} |')
+        if status.get("skipped"):
+            continue
         log_path = path.parent / "test.log"
         if log_path.is_file():
             log = log_path.read_text(errors="replace")
@@ -202,16 +221,14 @@ def write_report(root, rows):
         lines += ["", "### Superseded harness runs", "", "These runs used superseded fixtures or preparation conditions. Their raw startup rejections remain evidence of readiness behavior; current scenario outcomes come from the reruns. `historical-runs.json` records each reason.", "", "| Target | Suite | Classification |", "|---|---|---|"]
         for h in historical:
             lines.append(f'| {h["target"]} | {h["suite"]} | {h["classification"]} |')
-    current = aggregates.get(("node-current", 110, 1))
-    combined = aggregates.get(("node-combined", 110, 1))
-    if current and combined and current["p50"] and combined["p50"] is not None:
-        comparison = []
-        for name in ("node-current", "node-pr1", "node-combined", "go-livepeer"):
-            r = aggregates.get((name, 110, 1))
-            if r:
-                comparison.append(f'**{name}: {fmt(r["p50"])} ms** ({r["successes"]}/{r["attempts"]} successful)')
+    comparison = []
+    for name in names:
+        r = aggregates.get((name, 110, 1))
+        if r:
+            comparison.append(f'**{name}: {fmt(r["p50"])} ms** ({r["successes"]}/{r["attempts"]} successful)')
+    if comparison:
         lines[4:4] = ["At 110 ms additional RPC latency with one client, median warm dispatch was " + "; ".join(comparison) + ".", ""]
-    lines += ["", "## Reproduction and limits", "", "Run `python3 performance/gcp.py --combined-checkout /absolute/path/to/reviewed/checkout --reviewed`. It provisions one VM, builds the pinned source snapshots, deploys the protocol, runs the comparisons, collects results, and deletes the VM. GCP authentication and the reviewed checkout are prerequisites.", "", "The manifest contains binary hashes, Go source hashes for the harness, CPU/platform details, and protocol test parameters. Request records retain actual face values, win probabilities, and ticket counts. Performance uses rare winners; correctness uses frequent winners with ticket face values covering actual devnet gas. The protocol's unlock period is two rounds for bounded withdrawal tests. Local devnet finality exercises application behavior; it does not establish production consensus safety.", ""]
+    lines += ["", "## Reproduction and limits", "", "Configure additional Node builds in `test.local.env`, then run `E2E_ENV_FILE=test.local.env python3 performance/gcp.py`. The driver provisions one VM, builds frozen source snapshots, deploys the protocol, runs the comparisons, collects results, and deletes the VM. GCP authentication and Go are prerequisites. The manifest retains repository URLs, requested refs, and resolved revisions.", "", "The manifest contains binary hashes, Go source hashes for the harness, CPU/platform details, and protocol test parameters. Request records retain actual face values, win probabilities, and ticket counts. Performance uses rare winners; correctness uses frequent winners with ticket face values covering actual devnet gas. The protocol's unlock period is two rounds for bounded withdrawal tests. Local devnet finality exercises application behavior; it does not establish production consensus safety.", ""]
     lines += ["The real-process chain mines at one-second intervals. Different execution-block cadence, catch-up gaps, and event-heavy histories can change observer refresh cost. The population test's constant quiet-head cost does not imply constant cost when every payer changes on-chain.", ""]
     lines += ["Goodput covers the specified finite closed-loop bursts. Longer runs are needed to estimate sustained capacity, especially for the cached paths whose load windows finish quickly.", ""]
     (root / "REPORT.md").write_text("\n".join(lines))

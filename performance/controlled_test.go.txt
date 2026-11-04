@@ -1,4 +1,4 @@
-// Test-only comparison overlay. The fixture retains its upstream MIT attribution.
+// Test-only comparison overlay. The provider fixture is supplied by the caller.
 package eth
 
 import (
@@ -153,7 +153,7 @@ func TestComparisonDistinctColdBurst(t *testing.T){
  close(gate)
  rejected:=0;for range 32{if <-results!=nil{rejected++}}
  comparisonReport(t,"distinct_cold_burst",map[string]any{"peak_simultaneous_sender_reads":peak.Load(),"rejected":rejected,"attempts":32})
- if "__TARGET__"=="node-combined"{require.LessOrEqual(t,peak.Load(),int64(4))}
+ if __BOUNDED_READS__{require.LessOrEqual(t,peak.Load(),int64(4))}
 }
 
 func TestComparisonChainBudget(t *testing.T){
