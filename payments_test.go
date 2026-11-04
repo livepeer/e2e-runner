@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -58,6 +59,12 @@ func startSigner(t *testing.T, opts signerOptions) *testSigner {
 	var args []string
 	if opts.backend == "node" {
 		config := map[string]any{"Listen": addr, "MetricsListen": metricsAddr, "KeystoreFile": opts.account.keystore, "KeystorePasswordFile": opts.account.passwordFile, "RPCURLFile": secretFile(t, dir, "rpc", opts.chain.url), "ChainID": opts.chain.chainID.Uint64(), "Controller": opts.chain.controller.Hex(), "MaxHourlyPrice": envDefault("E2E_SIGNER_MAX_HOURLY_USD", "100"), "MaxFixedPrice": envDefault("E2E_SIGNER_MAX_FIXED_USD", "1"), "WeiPerUSD": envDefault("E2E_WEI_PER_USD", "1000000000000000"), "Orchestrators": []string{opts.orch.httpBase}, "DiscoveryGrants": []string{opts.orch.httpAddr}}
+		config["Network"] = "devenv"
+		for key, name := range map[string]string{"MaxTicketEV": "E2E_SIGNER_MAX_TICKET_EV", "MaxBatchEV": "E2E_SIGNER_MAX_BATCH_EV"} {
+			if value := os.Getenv(name); value != "" {
+				config[key] = value
+			}
+		}
 		if opts.useOracle {
 			delete(config, "WeiPerUSD")
 			config["ETHUSDFeed"] = opts.chain.feed.Hex()
@@ -229,6 +236,11 @@ func (j *paymentJob) generate(t *testing.T, headers map[string]string) (int, []b
 func (j *paymentJob) sign(t *testing.T, headers map[string]string) {
 	t.Helper()
 	status, body := j.generate(t, headers)
+	j.signed(t, status, body)
+}
+
+func (j *paymentJob) signed(t *testing.T, status int, body []byte) {
+	t.Helper()
 	require.Equal(t, 200, status, string(body))
 	require.NoError(t, json.Unmarshal(body, &j.payment))
 	require.NotEmpty(t, j.payment.Payment)
@@ -238,12 +250,31 @@ func (j *paymentJob) sign(t *testing.T, headers map[string]string) {
 	require.Equal(t, j.signer.account.address.Bytes(), wireBytes(t, payment, 2), "payment payer identity")
 	require.Equal(t, j.orch.paymentRecipient().Bytes(), wireBytes(t, wireBytes(t, payment, 1), 1), "signed ticket recipient")
 }
+
+// Prepare a funded recovery fixture before enabling its scenario's faults.
+// Measured performance requests and negative admission cases never use this.
+func (j *paymentJob) signWhenReady(t *testing.T, headers map[string]string) {
+	t.Helper()
+	eventually(t, func() bool {
+		status, body := j.generate(t, headers)
+		if status == 400 && strings.Contains(string(body), "payer funds unavailable") {
+			return false
+		}
+		j.signed(t, status, body)
+		return true
+	}, envDuration(t, "E2E_ACCOUNTING_TIMEOUT", "20s"), 300*time.Millisecond, "recovery signer observes funded payer")
+}
 func (j *paymentJob) headers() map[string]string {
 	return map[string]string{"Livepeer-Payer-Address": j.signer.account.address.Hex(), "Livepeer-Payment": j.payment.Payment, "Livepeer-Segment": j.payment.Segment}
 }
 func (j *paymentJob) submit(t *testing.T) sessionResponse {
 	t.Helper()
 	status, body := httpJSON(t, http.MethodPost, j.target(), map[string]any{"prompt": "hello"}, j.headers())
+	return j.submitted(t, status, body)
+}
+
+func (j *paymentJob) submitted(t *testing.T, status int, body []byte) sessionResponse {
+	t.Helper()
 	require.Equal(t, 200, status, string(body))
 	var session sessionResponse
 	if j.mode == "persistent" {
@@ -341,8 +372,10 @@ type httptestServerCount struct {
 
 type paidSetupOptions struct {
 	orchestrator      orchestratorOptions
-	isolatedRecipient bool // Required when a case deliberately changes staking.
-	snapshot          bool // Snapshot after R setup, before fixture workers start.
+	isolatedRecipient bool                                      // Required when a case deliberately changes staking.
+	workerChain       func(string, *chainFixture) *chainFixture // Per-process observation/fault proxies.
+	recipient         *chainAccount                             // Optional run-owned recipient for serialized comparison cells.
+	snapshot          bool                                      // Snapshot after R setup, before fixture workers start.
 }
 
 func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string, wallets walletMode, webhook, headers string, kafka map[string]any, overrides ...paidSetupOptions) *paidFixture {
@@ -354,7 +387,10 @@ func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string,
 		options = overrides[0]
 	}
 	c.configureFunding(t)
-	recipient := c.paidRecipient(t, options.isolatedRecipient)
+	recipient := options.recipient
+	if recipient == nil {
+		recipient = c.paidRecipient(t, options.isolatedRecipient)
+	}
 	if options.snapshot {
 		c.requireControl(t, recipient)
 	}
@@ -387,12 +423,19 @@ func setupPaid(t *testing.T, c *chainFixture, orchBackend, signerBackend string,
 	f.upstream.url = server.URL
 	opts := options.orchestrator
 	opts.backend, opts.account, opts.chain = orchBackend, redeemer, c
+	if options.workerChain != nil {
+		opts.chain = options.workerChain("orchestrator", c)
+	}
 	opts.recipient = common.Address{}
 	if wallets == splitWallet {
 		opts.recipient = recipient.address
 	}
 	f.orch = startOrchestrator(t, opts)
-	f.signer = startSigner(t, signerOptions{backend: signerBackend, chain: c, account: payer, orch: f.orch, webhook: webhook, webhookHeaders: headers, kafka: kafka})
+	signerChain := c
+	if options.workerChain != nil {
+		signerChain = options.workerChain("signer", c)
+	}
+	f.signer = startSigner(t, signerOptions{backend: signerBackend, chain: signerChain, account: payer, orch: f.orch, webhook: webhook, webhookHeaders: headers, kafka: kafka})
 	return f
 }
 

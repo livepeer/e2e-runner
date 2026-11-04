@@ -5,6 +5,7 @@ package main
 
 import (
 	"cmp"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,6 +33,18 @@ func run() error {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		args = []string{"test", "-count=1", "./..."}
+	}
+	// Reuse the same dotenv parser and process-environment precedence for the
+	// Python performance driver. Export only its input settings.
+	if args[0] == "performance-config" {
+		settings := make(map[string]string)
+		for _, entry := range os.Environ() {
+			key, value, _ := strings.Cut(entry, "=")
+			if strings.HasPrefix(key, "E2E_PERF_NODE_") || key == "E2E_PERF_CONTROLLED_FIXTURE" {
+				settings[key] = value
+			}
+		}
+		return json.NewEncoder(os.Stdout).Encode(settings)
 	}
 	if args[0] == "compose" || args[0] == "compose-gcp" {
 		if len(args) == 1 {

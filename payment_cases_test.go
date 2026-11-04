@@ -6,6 +6,8 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -345,7 +347,10 @@ func runFundingCases(t *testing.T, f *paidFixture) {
 		deposit, reserve string
 	}{{"no deposit", "0", "0.1"}, {"no reserve", "0.1", "0"}, {"insufficient deposit", "0.000000000000000001", "0.1"}, {"withdrawing", "0.1", "0.1"}} {
 		t.Run("funding/"+tc.name, func(t *testing.T) {
-			if tc.name == "withdrawing" {
+			if tc.name == "withdrawing" && os.Getenv("E2E_CHAIN_REALTIME") != "true" {
+				// Natural mining changes only this test-owned payer. Rewinding
+				// it under live workers would leave their monotonic expiry
+				// guards ahead of the chain for the following admission case.
 				t.Cleanup(func() {
 					f.chain.initializeRound(t, f.payer)
 					require.True(t, f.chain.recipientActive(t, f.recipient), "recipient remains active after snapshot restore")
@@ -384,7 +389,19 @@ func runFundingCases(t *testing.T, f *paidFixture) {
 				require.NoError(t, json.Unmarshal(body, &j.payment))
 				return true
 			}, envDuration(t, "E2E_ACCOUNTING_TIMEOUT", "20s"), 300*time.Millisecond, "funding recovery")
-			session := j.submit(t)
+			// Signer and recipient caches poll independently. A successful
+			// signature does not imply the recipient has observed the deposit.
+			var submittedStatus int
+			var submittedBody []byte
+			eventually(t, func() bool {
+				submittedStatus, submittedBody = httpJSON(t, "POST", j.target(), map[string]any{"prompt": "hello"}, j.headers())
+				if (submittedStatus == 400 || submittedStatus == 503) && (strings.Contains(string(submittedBody), "payer deposit") || strings.Contains(string(submittedBody), "chain observation")) {
+					return false
+				}
+				require.Equal(t, 200, submittedStatus, string(submittedBody))
+				return true
+			}, envDuration(t, "E2E_ACCOUNTING_TIMEOUT", "20s"), 300*time.Millisecond, "recipient observes restored collateral")
+			session := j.submitted(t, submittedStatus, submittedBody)
 			stopPaidSession(t, f.orch, j.route, session.SessionID)
 		})
 	}
