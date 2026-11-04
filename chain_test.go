@@ -463,6 +463,12 @@ func (c *chainFixture) initializeRound(t *testing.T, a *chainAccount) {
 	if !c.call(t, "roundsManager", c.rounds, "currentRoundInitialized")[0].(bool) {
 		output, err := c.nodeCLI(t, a, true, "round", "initialize")
 		if err != nil {
+			if os.Getenv("E2E_CHAIN_REALTIME") == "true" {
+				// The devnet keeper may initialize between this CLI's pinned
+				// preflight and submission, including across a round boundary.
+				eventually(t, func() bool { return c.call(t, "roundsManager", c.rounds, "currentRoundInitialized")[0].(bool) }, 10*time.Second, 100*time.Millisecond, "round initialization did not recover: %v\n%s", err, output)
+				return
+			}
 			require.True(t, c.call(t, "roundsManager", c.rounds, "currentRoundInitialized")[0].(bool), "round initialization failed: %v\n%s", err, output)
 		}
 	}
@@ -577,9 +583,14 @@ func (c *chainFixture) requireFinality(t *testing.T) {
 }
 func (c *chainFixture) checkControl(t *testing.T) {
 	t.Helper()
-	var modules map[string]string
-	c.request(t, &modules, "rpc_modules")
-	require.Contains(t, modules, "evm", "INFRASTRUCTURE: snapshot/revert, expiry and reorg tests need evm controls")
+	// Probe the capabilities themselves: Anvil implements these methods without
+	// geth's optional rpc_modules endpoint.
+	var snapshot string
+	c.request(t, &snapshot, "evm_snapshot")
+	require.NotEmpty(t, snapshot, "INFRASTRUCTURE: snapshot capability")
+	var restored bool
+	c.request(t, &restored, "evm_revert", snapshot)
+	require.True(t, restored, "INFRASTRUCTURE: snapshot restore capability")
 }
 func (c *chainFixture) requireControl(t *testing.T, recipient ...*chainAccount) string {
 	t.Helper()

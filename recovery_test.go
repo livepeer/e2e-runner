@@ -24,10 +24,21 @@ import (
 )
 
 type rpcFaults struct {
-	down          atomic.Bool
-	finalizedDown atomic.Bool
-	receiptsDown  atomic.Bool
-	highFee       atomic.Bool
+	down           atomic.Bool
+	finalizedDown  atomic.Bool
+	receiptsDown   atomic.Bool
+	highFee        atomic.Bool
+	finalizedBlock atomic.Value // Immutable actual finalized response held during confirmation tests.
+}
+
+func (f *rpcFaults) holdFinalized(t *testing.T, c *chainFixture) {
+	t.Helper()
+	var block json.RawMessage
+	c.request(t, &block, "eth_getBlockByNumber", "finalized", false)
+	require.NotEmpty(t, block)
+	require.NotEqual(t, "null", string(block))
+	f.finalizedBlock.Store(append(json.RawMessage(nil), block...))
+	f.finalizedDown.Store(true)
 }
 
 type rpcRequest struct {
@@ -71,7 +82,11 @@ func faultRPC(t *testing.T, c *chainFixture, hooks ...rpcHook) *rpcFaults {
 			return
 		}
 		if fault.finalizedDown.Load() && request.Method == "eth_getBlockByNumber" && len(request.Params) > 0 && string(request.Params[0]) == `"finalized"` {
-			respondJSON(t, w, map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": nil})
+			var result any
+			if held := fault.finalizedBlock.Load(); held != nil {
+				result = held.(json.RawMessage)
+			}
+			respondJSON(t, w, map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
 			return
 		}
 		proxy.ServeHTTP(w, r)
@@ -82,6 +97,10 @@ func faultRPC(t *testing.T, c *chainFixture, hooks ...rpcHook) *rpcFaults {
 
 func (c *chainFixture) mineTo(t *testing.T, target uint64) {
 	t.Helper()
+	if os.Getenv("E2E_CHAIN_REALTIME") == "true" {
+		eventually(t, func() bool { return c.block(t) > target }, envDuration(t, "E2E_BLOCK_TIMEOUT", "3m"), 500*time.Millisecond, "INFRASTRUCTURE: natural chain advancement beyond block %d", target)
+		return
+	}
 	start := c.block(t)
 	if start > target {
 		return
@@ -95,6 +114,10 @@ func (c *chainFixture) mineTo(t *testing.T, target uint64) {
 
 func (c *chainFixture) advanceTo(t *testing.T, target uint64) {
 	t.Helper()
+	if os.Getenv("E2E_CHAIN_REALTIME") == "true" {
+		c.mineTo(t, target)
+		return
+	}
 	var modules map[string]string
 	c.request(t, &modules, "rpc_modules")
 	if _, controlled := modules["evm"]; controlled {
@@ -149,7 +172,7 @@ func makeWinning(t *testing.T, f *paidFixture, headers map[string]string, before
 		for _, prepare := range beforeSign {
 			prepare(j)
 		}
-		j.sign(t, headers)
+		j.signWhenReady(t, headers)
 		s := j.submit(t)
 		stopPaidSession(t, f.orch, j.route, s.SessionID)
 		j.closeRunner()
@@ -162,7 +185,7 @@ func makeWinning(t *testing.T, f *paidFixture, headers map[string]string, before
 	t.Fatal("no observed winning ticket in 16 bounded jobs; do not assume every probabilistic ticket wins")
 	return nil
 }
-func waitSettlement(t *testing.T, f *paidFixture, ticket *observedTicket) *types.Receipt {
+func waitSettlement(t *testing.T, f *paidFixture, ticket *observedTicket, revealed ...*types.Receipt) *types.Receipt {
 	t.Helper()
 	var receipt *types.Receipt
 	eventually(t, func() bool {
@@ -176,14 +199,25 @@ func waitSettlement(t *testing.T, f *paidFixture, ticket *observedTicket) *types
 		err := f.chain.rpc.CallContext(ctx, &receipt, "eth_getTransactionReceipt", latest.Tx)
 		return err == nil && receipt != nil
 	}, envDuration(t, "E2E_REDEMPTION_TIMEOUT", "90s"), 300*time.Millisecond, "redemption receipt: %s", readLog(t, f.orch.logPath))
-	verifySettlement(t, f, ticket, receipt)
+	verifySettlement(t, f, ticket, receipt, revealed...)
 	return receipt
 }
 
-func verifySettlement(t *testing.T, f *paidFixture, ticket *observedTicket, receipt *types.Receipt) {
+func verifySettlement(t *testing.T, f *paidFixture, ticket *observedTicket, receipt *types.Receipt, revealed ...*types.Receipt) {
 	t.Helper()
 	require.Equal(t, uint64(1), receipt.Status)
-	require.Greater(t, receipt.BlockNumber.Uint64(), ticket.Expiry, "randomness revealed after ticket acceptance window")
+	if len(revealed) == 1 && receipt.TxHash == revealed[0].TxHash {
+		// The same signed transaction already exposed its randomness on the
+		// discarded branch. A public replay can be mined earlier after a deep
+		// rollback; its original publication must still have followed expiry.
+		require.Greater(t, revealed[0].BlockNumber.Uint64(), ticket.Expiry, "original randomness reveal followed ticket acceptance window")
+		t.Logf("canonical replay of already-revealed transaction %s: original block=%s canonical block=%s expiry=%d", receipt.TxHash, revealed[0].BlockNumber, receipt.BlockNumber, ticket.Expiry)
+	} else {
+		require.Greater(t, receipt.BlockNumber.Uint64(), ticket.Expiry, "randomness revealed after ticket acceptance window")
+	}
+	var canonical struct{ Hash common.Hash }
+	f.chain.request(t, &canonical, "eth_getBlockByNumber", hexutil.EncodeBig(receipt.BlockNumber), false)
+	require.Equal(t, canonical.Hash, receipt.BlockHash, "settlement receipt must be canonical")
 	tx, err := f.chain.rpcTransaction(t, receipt.TxHash)
 	require.NoError(t, err)
 	require.NotNil(t, tx)
@@ -234,7 +268,7 @@ func TestOnchainRecovery(t *testing.T) {
 				if scenario == "expired parameters" {
 					j := f.job(t, "hour", "persistent")
 					j.obtainChallenge(t)
-					j.sign(t, nil)
+					j.signWhenReady(t, nil)
 					session := j.submit(t)
 					defer stopPaidSession(t, f.orch, j.route, session.SessionID)
 					params := wireBytes(t, decode64(t, j.challenge.PaymentParams), 2)
@@ -262,7 +296,9 @@ func TestOnchainRecovery(t *testing.T) {
 					faults.down.Store(true)
 				}
 				if (scenario == "delayed finality" || scenario == "reorg recovery") && orch == "node" {
-					faults.finalizedDown.Store(true)
+					// Keep a genuine older finalized head available for nonce
+					// preparation while holding confirmation behind the receipt.
+					faults.holdFinalized(t, c)
 				}
 				if scenario == "delayed finality" && orch == "go-livepeer" {
 					// go-livepeer confirms from mined receipts rather than the
@@ -325,7 +361,7 @@ func TestOnchainRecovery(t *testing.T) {
 					f.orch = startOrchestrator(t, normalOptions)
 				}
 				c.initializeRound(t, f.payer)
-				waitSettlement(t, f, ticket)
+				revealed := waitSettlement(t, f, ticket)
 				if scenario == "delayed finality" && orch == "node" {
 					db := openReadDB(t, paymentDB(f.orch))
 					defer db.Close()
@@ -349,7 +385,7 @@ func TestOnchainRecovery(t *testing.T) {
 					require.True(t, c.recipientActive(t, f.recipient), "recipient remains active after reorg")
 					f.orch = startOrchestrator(t, f.orch.opts)
 					c.mineTo(t, ticket.Expiry+3)
-					_ = waitSettlement(t, f, ticket)
+					_ = waitSettlement(t, f, ticket, revealed)
 					faults.finalizedDown.Store(false)
 					deposit2, reserve2, _ := senderEscrow(t, c, f.payer.address)
 					require.Equal(t, new(big.Int).Add(deposit, reserve).String(), new(big.Int).Add(deposit2, reserve2).String(), "one canonical settlement after reorg")

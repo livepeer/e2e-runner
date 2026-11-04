@@ -1,0 +1,191 @@
+// Test-only comparison overlay. The fixture retains its upstream MIT attribution.
+package eth
+
+import (
+ "bytes"
+ "context"
+ "encoding/json"
+ "fmt"
+ "io"
+ "math/big"
+ "net/http"
+ "net/http/httptest"
+ "sync/atomic"
+ "testing"
+ "time"
+ "github.com/ethereum/go-ethereum/common"
+ "github.com/ethereum/go-ethereum/core/types"
+ "github.com/ethereum/go-ethereum/crypto"
+ fixture "github.com/livepeer/node/internal/performancefixture"
+ "github.com/stretchr/testify/require"
+)
+
+type comparisonChain struct {
+ snapshot func(context.Context)(ChainSnapshot,error)
+ funds func(context.Context,common.Address,common.Address)(SenderInfo,error)
+ active func(context.Context,common.Address,ChainSnapshot)(bool,error)
+ refresh func(context.Context) error
+ advance func()
+ rpc *fixture.ChainRPC
+ trips *atomic.Int64
+ recipient common.Address
+}
+
+func newComparisonChain(t testing.TB) comparisonChain {
+ t.Helper()
+ f:=fixture.NewChainRPC(t)
+ var trips atomic.Int64
+ // Model a provider accepting batches without charging one transport per
+ // contained call. The underlying fixture still validates each pinned read.
+ server:=httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+  trips.Add(1)
+  data,err:=io.ReadAll(r.Body); if err!=nil { http.Error(w,"body",400);return }
+  send:=func(data []byte)json.RawMessage{
+   req,err:=http.NewRequestWithContext(r.Context(),"POST",f.URL,bytes.NewReader(data)); if err!=nil{return nil}
+   response,err:=http.DefaultClient.Do(req); if err!=nil{return nil};defer response.Body.Close()
+   value,_:=io.ReadAll(response.Body);return value
+  }
+  w.Header().Set("Content-Type","application/json")
+  if len(data)>0 && data[0]=='[' {
+   var batch []json.RawMessage;_ = json.Unmarshal(data,&batch)
+   values:=make([]json.RawMessage,len(batch));for i,v:=range batch{values[i]=send(v)}
+   _=json.NewEncoder(w).Encode(values)
+  }else{_,_=w.Write(send(data))}
+ }))
+ t.Cleanup(server.Close)
+ rpc,err:=OpenRPC(server.URL);require.NoError(t,err);t.Cleanup(rpc.Close)
+ contracts,err:=NewContracts(rpc,f.Controller);require.NoError(t,err)
+ direct:=PaymentChain{Contracts:contracts}
+ now:=time.Now()
+ c:=comparisonChain{snapshot:direct.Snapshot,funds:direct.SenderInfo,active:direct.IsActiveAt,refresh:func(context.Context)error{return nil},rpc:f,trips:&trips,recipient:common.HexToAddress("0x22")}
+ c.advance=func(){now=now.Add(time.Second);prior:=f.State();f.Update(func(s *fixture.ChainState){s.Number++;s.L1Block++;s.Parent=prior.Hash;s.Hash=common.BigToHash(new(big.Int).SetUint64(s.Number));s.Timestamp=uint64(now.Unix())})}
+ __ADAPTER__
+ require.NoError(t,c.refresh(context.Background()))
+ return c
+}
+
+func comparisonReport(t testing.TB, label string, value any){t.Helper();data,err:=json.Marshal(map[string]any{"target":"__TARGET__","case":label,"result":value});require.NoError(t,err);t.Log("PERF_JSON "+string(data))}
+
+func TestComparisonFrozenHead(t *testing.T){
+ c:=newComparisonChain(t)
+ payer:=common.HexToAddress("0x11")
+ _,err:=c.funds(t.Context(),payer,c.recipient);require.NoError(t,err)
+ // Advancing the service clock while returning the exact same head must not
+ // refresh a cached observation's age. Header timestamp remains unchanged.
+ __FROZEN_CLOCK__
+ err=c.refresh(t.Context())
+ _,readErr:=c.funds(t.Context(),payer,c.recipient)
+ comparisonReport(t,"frozen_head",map[string]bool{"refresh_rejected":err!=nil,"funds_rejected":readErr!=nil})
+ if __CACHED__ {require.Error(t,readErr,"repeated contact must not make an unchanged head fresh forever")}
+}
+
+func TestComparisonKnownReorgFailedBackfill(t *testing.T){
+ c:=newComparisonChain(t);payer:=common.HexToAddress("0x11")
+ _,err:=c.funds(t.Context(),payer,c.recipient);require.NoError(t,err)
+ c.rpc.Update(func(s *fixture.ChainState){s.Hash=common.HexToHash("0xdddd");s.Fail="Controller.getContract"})
+ refreshErr:=c.refresh(t.Context())
+ _,readErr:=c.funds(t.Context(),payer,c.recipient)
+ comparisonReport(t,"known_reorg_failed_backfill",map[string]bool{"refresh_rejected":refreshErr!=nil,"funds_rejected":readErr!=nil})
+ require.Error(t,readErr,"a failed replacement observation must not leave known-orphaned collateral usable")
+}
+
+func TestComparisonFundingAndRegistry(t *testing.T){
+ for _,change:=range []string{"funding","current_round","registry"}{t.Run(change,func(t *testing.T){
+  c:=newComparisonChain(t);payer:=common.HexToAddress("0x11")
+  _,err:=c.funds(t.Context(),payer,c.recipient);require.NoError(t,err)
+  c.advance()
+  c.rpc.Update(func(s *fixture.ChainState){
+   s.Deposit=13;s.Claimable=17
+   switch change{
+    case "funding":s.Logs=[]types.Log{{Address:s.Contracts["TicketBroker"],BlockHash:s.Hash,BlockNumber:s.Number,Topics:[]common.Hash{crypto.Keccak256Hash([]byte("DepositFunded(address,uint256)")),common.BytesToHash(payer.Bytes())}}}
+    case "current_round":s.CurrentRound++
+    case "registry":s.Contracts["TicketBroker"]=common.HexToAddress("0xb3")
+   }
+  })
+  require.NoError(t,c.refresh(t.Context()))
+  info,err:=c.funds(t.Context(),payer,c.recipient);require.NoError(t,err)
+  comparisonReport(t,change,map[string]string{"deposit":info.Deposit.String(),"claimable":info.Reserve.String()})
+  require.Equal(t,int64(13),info.Deposit.Int64());require.Equal(t,int64(17),info.Reserve.Int64())
+ })}
+}
+
+func TestComparisonColdCancellationAndIsolation(t *testing.T){
+ c:=newComparisonChain(t);payer:=common.HexToAddress("0x11");bad:=common.HexToAddress("0xbad")
+ _,err:=c.funds(t.Context(),payer,c.recipient);require.NoError(t,err)
+ c.rpc.Update(func(s *fixture.ChainState){s.FailPayer=bad})
+ _,err=c.funds(t.Context(),bad,c.recipient);require.Error(t,err)
+ _,err=c.funds(t.Context(),payer,c.recipient);require.NoError(t,err)
+ ctx,cancel:=context.WithCancel(t.Context());cancel();before:=c.trips.Load()
+ _,err=c.funds(ctx,common.HexToAddress("0xcafe"),c.recipient);require.Error(t,err)
+ require.Equal(t,before,c.trips.Load(),"cancelled caller must not start RPCs")
+}
+
+func TestComparisonInFlightCancellation(t *testing.T){
+ c:=newComparisonChain(t)
+ entered,exited,release:=make(chan struct{}),make(chan struct{}),make(chan struct{})
+ defer close(release)
+ c.rpc.Update(func(s *fixture.ChainState){s.Before=func(ctx context.Context,name string){
+  if name!="TicketBroker.getSenderInfo"{return}
+  close(entered);defer close(exited)
+  select{case <-ctx.Done():case <-release:}
+ }})
+ ctx,cancel:=context.WithCancel(t.Context());defer cancel()
+ result:=make(chan error,1)
+ go func(){_,err:=c.funds(ctx,common.HexToAddress("0x666"),c.recipient);result<-err}()
+ select{case <-entered:case <-time.After(3*time.Second):t.Fatal("cold read did not reach provider")}
+ cancel()
+ select{case err:=<-result:require.Error(t,err);case <-time.After(2*time.Second):t.Fatal("cancelled caller did not return")}
+ stopped:=false
+ select{case <-exited:stopped=true;case <-time.After(200*time.Millisecond):}
+ comparisonReport(t,"inflight_cancellation",map[string]bool{"provider_work_stopped":stopped})
+ require.True(t,stopped,"the last cancelled waiter must not retain a provider read")
+}
+
+func TestComparisonDistinctColdBurst(t *testing.T){
+ c:=newComparisonChain(t);warm:=common.HexToAddress("0x11")
+ _,err:=c.funds(t.Context(),warm,c.recipient);require.NoError(t,err)
+ gate:=make(chan struct{});var active,peak atomic.Int64
+ c.rpc.Update(func(s *fixture.ChainState){s.Before=func(ctx context.Context,name string){if name!="TicketBroker.getSenderInfo"{return};n:=active.Add(1);defer active.Add(-1);for{old:=peak.Load();if old>=n||peak.CompareAndSwap(old,n){break}};select{case <-gate:case <-ctx.Done():}}})
+ results:=make(chan error,32)
+ for i:=0;i<32;i++{go func(i int){ctx,cancel:=context.WithTimeout(t.Context(),time.Second);defer cancel();_,err:=c.funds(ctx,common.BigToAddress(big.NewInt(int64(100+i))),c.recipient);results<-err}(i)}
+ time.Sleep(100*time.Millisecond)
+ if __CACHED__{before:=c.trips.Load();_,err:=c.funds(t.Context(),warm,c.recipient);require.NoError(t,err);require.Equal(t,before,c.trips.Load(),"cold pressure must preserve warm local reads")}
+ close(gate)
+ rejected:=0;for range 32{if <-results!=nil{rejected++}}
+ comparisonReport(t,"distinct_cold_burst",map[string]any{"peak_simultaneous_sender_reads":peak.Load(),"rejected":rejected,"attempts":32})
+ if "__TARGET__"=="node-combined"{require.LessOrEqual(t,peak.Load(),int64(4))}
+}
+
+func TestComparisonChainBudget(t *testing.T){
+ orch,signer:=newComparisonChain(t),newComparisonChain(t)
+ payer:=common.HexToAddress("0x11")
+ request:=func(){
+  snapshot,err:=orch.snapshot(t.Context());require.NoError(t,err)
+  _,err=orch.active(t.Context(),orch.recipient,snapshot);require.NoError(t,err)
+  for _,c:=range []*comparisonChain{&signer,&signer,&orch}{info,err:=c.funds(t.Context(),payer,orch.recipient);require.NoError(t,err);snapshot=info.Snapshot}
+  _,err=orch.active(t.Context(),orch.recipient,snapshot);require.NoError(t,err)
+ }
+ before:=orch.trips.Load()+signer.trips.Load();request();cold:=orch.trips.Load()+signer.trips.Load()-before
+ before=orch.trips.Load()+signer.trips.Load();request();warm:=orch.trips.Load()+signer.trips.Load()-before
+ comparisonReport(t,"legacy_chain_read_sequence",map[string]int64{"cold_exchanges":cold,"warm_exchanges":warm})
+ if __CACHED__{require.Zero(t,warm)}else{require.EqualValues(t,29,warm)}
+}
+
+func TestComparisonPayerPopulation(t *testing.T){
+ for _,population:=range []int{0,16,128,1024}{t.Run(fmt.Sprint(population),func(t *testing.T){
+  c:=newComparisonChain(t)
+  for i:=1;i<=population;i++{_,err:=c.funds(t.Context(),common.BigToAddress(big.NewInt(int64(i))),c.recipient);require.NoError(t,err)}
+  for _,workload:=range []string{"idle","known","churn"}{
+   if workload=="known"&&population==0{continue}
+   before:=c.trips.Load();callsBefore:=c.rpc.Stats().RoundTrips;start:=time.Now();count:=128
+   if workload=="idle"{count=8}
+   for i:=0;i<count;i++{
+    if workload=="idle"{c.advance();require.NoError(t,c.refresh(t.Context()))}else{
+     payer:=i%max(1,population)+1;if workload=="churn"{payer=population+i+1}
+     _,err:=c.funds(t.Context(),common.BigToAddress(big.NewInt(int64(payer))),c.recipient);require.NoError(t,err)
+    }
+   }
+   comparisonReport(t,"payer_population",map[string]any{"population":population,"workload":workload,"operations":count,"exchanges":c.trips.Load()-before,"contained_calls":c.rpc.Stats().RoundTrips-callsBefore,"elapsed_ms":float64(time.Since(start))/1e6})
+  }
+ })}
+}

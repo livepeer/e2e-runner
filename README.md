@@ -35,6 +35,8 @@ E2E_ORCHESTRATORS=node E2E_SIGNERS=node \
 
 The Go runner SDK version is pinned in [go.mod](go.mod). The Python integration uses the checkout selected by `PYTHON_RUNNER_DIR`; streaming coverage requires `StreamPayload` and the `on_payment_session` callback. The harness records source revisions and working-tree fingerprints in its [run artifacts](#run-artifacts).
 
+For payment-path performance comparisons across current Node, BlueClaw PR 1, a combined Node checkout, and upstream go-livepeer, see [the opt-in performance harness](performance/README.md). Its GCP driver measures real paid requests with controlled RPC delay, runs shared correctness checks, retains raw results, and deletes its temporary VM.
+
 `TestOnchainRedemptionConcurrency` exercises independent processes sharing a redemption wallet and separate databases: Node/Node, Node/go-livepeer in both collision orders, go-livepeer/go-livepeer, and two Nodes with go-livepeer. It also checks external nonce consumption, lost submission replies across restart, replacements and their limit, nonce-gap repair, duplicate tickets, and subsequent work. Its RPC barriers hold genuine nonce responses; transactions and receipts come from the configured chain.
 
 ```sh
