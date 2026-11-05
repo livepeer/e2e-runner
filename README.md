@@ -67,7 +67,7 @@ Compose requires a Linux host with Docker, Compose v2, Python 3, and all four so
 
 Components and SDK runners execute in separate containers. Callback assertions remain in the harness behind TLS adapters. HTTPS Quick Tunnels advertise component endpoints; gateways reuse hostnames between fixtures. Provisioning retries HTTP 429 up to five attempts, honoring valid `Retry-After` headers with exponential backoff as the minimum and fallback. Kafka uses a WSS bridge with SCRAM authentication. Only local origin/adapter connections use plaintext. TLS verification stays enabled and application ports remain private to loopback.
 
-Quick Tunnels use one hostname per endpoint, so Compose tests path templates (`https://…trycloudflare.com/e2e-proxy/{proxy}`); local mode tests hostname templates. The tunnel must preserve the selected tests' HTTP semantics. Current streaming validation exposes premature Cloudflare `100 Continue`; the upload assertions remain enabled. See [Quick Tunnel limits](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
+Quick Tunnels use one hostname per endpoint, so Compose tests path templates (`https://…trycloudflare.com/e2e-proxy/{proxy}`); local mode tests hostname templates. See [Quick Tunnel limits](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
 
 The default devnet does not guarantee finalized tags, canonical Ethereum headers, or mining/snapshot controls. Select a compatible protocol-deployed chain with `E2E_GETH_IMAGE` for the dependent suites; missing capabilities fail infrastructure prerequisites.
 
@@ -155,9 +155,11 @@ The successful-job matrix also varies Python/Go runner SDK, persistent/single-sh
 
 ### Streaming uploads
 
-`TestOnchainStreamingUploads` covers paid single-shot uploads against Node with both signer implementations, wallet modes, runner SDKs, and proxy settings. It verifies the `Expect: 100-continue` payment handshake: unpaid challenges and rejected tickets must leave the input unread and send no `100 Continue`; accepted payments must permit continuation and deliver every byte, checked by size and SHA-256. Delayed collateral checks expose premature continuation by proxies. The Python client also exercises async iterators and seekable files starting at a nonzero position, using `StreamPayload(expect100=True, retry_buffer=False)`.
+`TestOnchainStreamingUploads` covers paid single-shot uploads against Node with both signer implementations, wallet modes, runner SDKs, and proxy settings.
 
-Compose applies the same assertions through its HTTPS tunnels and fixture adapters. Every intermediary must preserve the `Expect` header and defer continuation until payment is accepted. go-livepeer orchestrators are skipped because they do not support this payment handshake.
+The Python client exercises async iterators and seekable files starting at a nonzero position, using `StreamPayload(retry_buffer=False)`. It requires the empty payment challenge and signing to leave the source unread. The paid request uploads immediately, so rejected payments may consume input but must not reach the application. Successful uploads must preserve every byte, checked by size and SHA-256, and caller-owned sources must remain open.
+
+Compose applies the same assertions through its HTTPS tunnels and fixture adapters.
 
 ```sh
 E2E_ENV_FILE=test.local.env E2E_ORCHESTRATORS=node \
