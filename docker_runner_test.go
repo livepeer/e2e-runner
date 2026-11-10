@@ -18,6 +18,7 @@ import (
 
 type runnerSDK interface {
 	RunnerID() string
+	AppIDs() []string
 	OrchestratorURL() string
 	HeartbeatInterval() time.Duration
 	Close(context.Context) error
@@ -28,11 +29,13 @@ type runnerSDK interface {
 
 type containerRunnerSDK struct {
 	base, token, id, orch string
+	apps                  []string
 	interval              time.Duration
 	closed                bool
 }
 
 func (r *containerRunnerSDK) RunnerID() string                 { return r.id }
+func (r *containerRunnerSDK) AppIDs() []string                 { return append([]string{}, r.apps...) }
 func (r *containerRunnerSDK) OrchestratorURL() string          { return r.orch }
 func (r *containerRunnerSDK) HeartbeatInterval() time.Duration { return r.interval }
 func (r *containerRunnerSDK) call(ctx context.Context, kind string, payload map[string]any, out any) error {
@@ -90,7 +93,7 @@ func startContainerGoRunner(t *testing.T, ctx context.Context, orch *testOrchest
 	require.NoError(t, err)
 	// Options also contains callbacks and an HTTP client. Serialize only the
 	// wire-safe registration fields; callbacks remain inside the SDK container.
-	options := map[string]any{"OrchestratorURL": orch.httpBase, "BootstrapSecret": liveRunnerSecret, "RunnerURL": cfg.runnerURL, "App": liveRunnerApp, "Metadata": cfg.metadata, "Mode": cfg.mode, "Proxy": cfg.proxy, "Capacity": cfg.capacity, "PriceInfo": price}
+	options := map[string]any{"OrchestratorURL": orch.httpBase, "BootstrapSecret": liveRunnerSecret, "Apps": []liverunner.AppOptions{{RunnerURL: cfg.runnerURL, App: liveRunnerApp, Metadata: cfg.metadata, Mode: cfg.mode, Proxy: cfg.proxy, Capacity: cfg.capacity, PriceInfo: price}}}
 	data, err := json.Marshal(map[string]any{"Listen": addr, "Token": token, "Options": options})
 	require.NoError(t, err)
 	dir := t.TempDir()
@@ -104,17 +107,21 @@ func startContainerGoRunner(t *testing.T, ctx context.Context, orch *testOrchest
 		}
 		var meta struct {
 			ID, URL  string
+			Apps     []string
 			Interval time.Duration
 		}
 		require.NoError(t, json.Unmarshal(data, &meta))
 		remote.id, remote.orch, remote.interval = meta.ID, meta.URL, meta.Interval
+		remote.apps = meta.Apps
 		return true
 	}, envDuration(t, "E2E_READY_TIMEOUT", "30s"), 100*time.Millisecond, readLog(t, process.logPath))
 	require.NotEmpty(t, remote.id)
+	require.Len(t, remote.apps, 1)
 	require.Equal(t, orch.httpBase, remote.orch)
 	require.NotZero(t, remote.interval)
 	runner := &goRunnerRegistration{ctx: ctx, reg: remote}
 	t.Cleanup(func() { runner.Close(t) })
+	waitRunnerByMetadata(t, orch, cfg.metadata)
 	return runner
 }
 

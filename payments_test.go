@@ -556,6 +556,10 @@ func TestOnchainPayments(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, f.payer.address, crypto.PubkeyToAddress(*key))
 		})
+		if orchBackend == "node" && signerBackend == "node" {
+			t.Run("multi-app isolation", func(t *testing.T) { runPaidMultiAppIsolation(t, f) })
+			t.Run("capacity failover", func(t *testing.T) { runPythonCapacityFailover(t, f) })
+		}
 		runPaidMatrix(t, f)
 		runPaymentBoundaries(t, f)
 		runPriceRegistration(t, f)

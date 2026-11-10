@@ -161,6 +161,8 @@ Paid payment, recovery, oracle, signing, and settlement tests exercise go-livepe
 
 The successful-job matrix also varies Python/Go runner SDK, persistent/single-shot mode, USD fixed/hourly price, and proxy setting: 128 combinations. Python performs successful payment flows; direct protocol requests supply invalid/conflicting inputs. CLI, infrastructure, off-chain, management-only, and listener-only tests run outside the wallet matrix.
 
+Node/Node also runs `multi-app isolation` with one real Go SDK owner, distinct app prices, independent capacity and payment/session credentials, heartbeat price changes, paid draining, channels/proxies, and `Runner.StopSession`. It covers persistent and single-shot siblings in both wallet modes. `capacity failover` discovers two real orchestrators with the Python gateway, fills the first after discovery, checks its 503 response contains no payment challenge, and requires selection to try the second. The explicit-orchestrator path currently fails because the gateway discards the second inventory; this remains a failing regression linked to [gateway issue #93](https://github.com/livepeer/livepeer-python-gateway/issues/93), rather than treating failed failover as success.
+
 ### Streaming uploads
 
 `TestOnchainStreamingUploads` covers paid single-shot uploads against Node with both signer implementations, wallet modes, runner SDKs, and proxy settings.
