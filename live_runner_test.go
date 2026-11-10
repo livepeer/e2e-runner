@@ -531,6 +531,9 @@ func runDynamicRunnerProxyRegistration(t *testing.T) {
 					})
 				}
 			}
+			if orch.backend == "node" && impl.Name() == "golang-runner" {
+				t.Run("heartbeats", func(t *testing.T) { runHeartbeatRegistration(t, orch) })
+			}
 		})
 	}
 }
@@ -787,6 +790,9 @@ func runRunnerSessionControlAPIs(t *testing.T) {
 
 			reg.Close(t)
 			requireRunnerAbsent(t, orch, runnerID)
+			if orch.backend == "node" && impl.Name() == "golang-runner" {
+				t.Run("lifecycle", func(t *testing.T) { runHeartbeatSessionLifecycle(t, orch) })
+			}
 		})
 	}
 }
@@ -968,13 +974,15 @@ func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cf
 	reg, err := liverunner.Register(ctx, liverunner.Options{
 		OrchestratorURL: orch.httpBase,
 		BootstrapSecret: liveRunnerSecret,
-		RunnerURL:       cfg.runnerURL,
-		App:             liveRunnerApp,
-		Metadata:        cfg.metadata,
-		Mode:            cfg.mode,
-		Proxy:           cfg.proxy,
-		Capacity:        cfg.capacity,
-		PriceInfo:       price,
+		Apps: []liverunner.AppOptions{{
+			RunnerURL: cfg.runnerURL,
+			App:       liveRunnerApp,
+			Metadata:  cfg.metadata,
+			Mode:      cfg.mode,
+			Proxy:     cfg.proxy,
+			Capacity:  cfg.capacity,
+			PriceInfo: price,
+		}},
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, reg.RunnerID())
@@ -985,6 +993,7 @@ func startGoRunner(t *testing.T, ctx context.Context, orch *testOrchestrator, cf
 	t.Cleanup(func() {
 		runner.Close(t)
 	})
+	waitRunnerByMetadata(t, orch, cfg.metadata)
 	return runner
 }
 
@@ -1034,7 +1043,7 @@ func (r *pythonRunner) Close(t *testing.T) {
 }
 
 func (r *goRunnerRegistration) RunnerID() string {
-	return r.reg.RunnerID()
+	return r.reg.AppIDs()[0]
 }
 
 func (r *goRunnerRegistration) OrchestratorURL() string {

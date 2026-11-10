@@ -50,7 +50,7 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/meta" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"id": reg.RunnerID(), "url": reg.OrchestratorURL(), "interval": reg.HeartbeatInterval()})
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": reg.RunnerID(), "apps": reg.AppIDs(), "url": reg.OrchestratorURL(), "interval": reg.HeartbeatInterval()})
 			return
 		}
 		var op operation
@@ -58,7 +58,7 @@ func main() {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		req, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.Options.RunnerURL, nil)
+		req, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.Options.Apps[0].RunnerURL, nil)
 		req.Header = op.Headers
 		var result any
 		var err error

@@ -142,6 +142,14 @@ Compare the hexadecimal response with the decimal `E2E_EXPECTED_CHAIN_ID` you co
 
 ## Off-chain parity coverage
 
+The Node/Go cases in `TestDynamicRunnerProxyRegistration` also cover empty registration, lost registration replies, restored identity and credentials, concurrent app updates, sequence recovery, and heartbeat events through a controllable HTTP fault proxy. `TestRunnerSessionControlAPIs` covers withdrawal, empty restart, draining sessions/requests/proxies/channels, zero/short drain deadlines, delayed O2R release, and retryable/concurrent retirement. These run through `make test-offchain` and the full suite. The sequence tests fence snapshots already accepted by Node; the SDK counter is in memory. To select only the Node/Go cases without chain, Python, or go-livepeer prerequisites:
+
+```sh
+E2E_ENV_FILE=test.local.env E2E_ORCHESTRATORS=node \
+  go run ./cmd/e2e test -race -count=1 -timeout 2m -v \
+  -run '^Test(DynamicRunnerProxyRegistration|RunnerSessionControlAPIs)$/node/golang-runner' .
+```
+
 Both orchestrators exercise Python/Go registration, discovery and capacity, authorization and session isolation, persistent/single-shot lifecycles, proxy routing, static startup/runtime registration, and health failures. Media tests decode two video and two audio tracks and verify their colors, frequencies, sample/frame counts, and segment statistics. Python owns media verification and exits unsuccessfully on failure.
 
 ## On-chain cases
