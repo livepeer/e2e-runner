@@ -29,6 +29,8 @@ services:
     <<: *component
   node-chain:
     <<: *component
+  node-redeemer:
+    <<: *component
   go-livepeer-signer:
     <<: *component
   go-livepeer-orchestrator:

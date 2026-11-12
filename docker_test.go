@@ -194,6 +194,8 @@ func componentService(name, bin string, args []string) string {
 		return "node-orchestrator"
 	case strings.Contains(name, "signer-node") || (len(args) > 0 && args[0] == "signer"):
 		return "node-signer"
+	case len(args) > 0 && args[0] == "redeemer":
+		return "node-redeemer"
 	case strings.Contains(bin, "/node/"):
 		return "node-chain"
 	default:

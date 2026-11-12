@@ -37,6 +37,15 @@ The Go runner SDK version is pinned in [go.mod](go.mod). The Python integration 
 
 For payment-path performance comparisons across configured Node builds and upstream go-livepeer, see [the opt-in performance harness](performance/README.md). Its GCP driver measures real paid requests with controlled RPC delay, runs correctness checks, retains raw results, and deletes its temporary VM.
 
+`TestOnchainRedeemer` tests Node's standalone redeemer with a keyless Node orchestrator, a Node signer, and an ETH-only redemption wallet. It checks expiry-gated forwarding, durable handoff before settlement, outages, lost/incorrect acknowledgments, duplicate delivery, independent process restarts, admission validation, global/per-recipient capacity and its release after settlement, and wallet/database binding policies. Real receipts must identify the dedicated gas payer and ticket recipient, with exactly one escrow debit. This suite does not run go-livepeer redeemers.
+
+```sh
+E2E_ENV_FILE=test.local.env \
+  go test -race -count=1 -timeout 30m -v -run '^TestOnchainRedeemer$' .
+```
+
+It requires canonical contract reads and real finalized blocks on the configured disposable chain. Source builds and Compose include `livepeer-redeemer`; prebuilt Node bundles must include it beside `livepeer` or in its `libexec` directory. Settlement evidence is saved under `E2E_ARTIFACT_DIR`.
+
 `TestOnchainRedemptionConcurrency` exercises independent processes sharing a redemption wallet and separate databases: Node/Node, Node/go-livepeer in both collision orders, go-livepeer/go-livepeer, and two Nodes with go-livepeer. It also checks external nonce consumption, lost submission replies across restart, replacements and their limit, nonce-gap repair, duplicate tickets, and subsequent work. Its RPC barriers hold genuine nonce responses; transactions and receipts come from the configured chain.
 
 ```sh
@@ -77,7 +86,7 @@ Local results are in `artifacts/e2e-*/artifacts`; GCP results are in `artifacts/
 
 ## Configuration and prerequisites
 
-Local process mode requires Go compatible with [go.mod](go.mod) and the configured Node and Clearinghouse modules; `uv`; the Python runner's locked environment and media dependencies; and go-livepeer binaries built with Live Runner support, including `livepeer_cli`. Node's dispatcher, orchestrator, signer, and chain executables are built from the configured checkout unless prebuilt binaries are supplied. Compose builds these dependencies inside its runtime image.
+Local process mode requires Go compatible with [go.mod](go.mod) and the configured Node and Clearinghouse modules; `uv`; the Python runner's locked environment and media dependencies; and go-livepeer binaries built with Live Runner support, including `livepeer_cli`. Node's dispatcher, orchestrator, signer, chain, and redeemer executables are built from the configured checkout unless prebuilt binaries are supplied. Compose builds these dependencies inside its runtime image.
 
 `test.env` contains portable test defaults and comments for required resource settings. Existing process variables take precedence over values loaded from the file. `E2E_ENV_FILE` selects another configuration file; a missing file is an error. Store environment-specific values in the ignored `test.local.env` or export them in the process environment. Use disposable credentials for these tests.
 

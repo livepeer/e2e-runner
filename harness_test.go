@@ -165,7 +165,7 @@ func binary(t *testing.T, backend string) string {
 			path = filepath.Join(buildRoot, spec.name)
 			targets := []string{"./cmd/" + spec.name}
 			if backend == "node" {
-				targets = append(targets, "./cmd/livepeer-orchestrator", "./cmd/livepeer-signer", "./cmd/livepeer-chain")
+				targets = append(targets, "./cmd/livepeer-orchestrator", "./cmd/livepeer-signer", "./cmd/livepeer-chain", "./cmd/livepeer-redeemer")
 			}
 			value, _ := builds.LoadOrStore(backend, &buildResult{})
 			result := value.(*buildResult)
@@ -337,8 +337,10 @@ func startOrchestrator(t *testing.T, opts orchestratorOptions) *testOrchestrator
 		}
 		if opts.account != nil {
 			config["RedeemerDB"] = filepath.Join(dir, "redeemer.sqlite")
-			config["KeystoreFile"] = opts.account.keystore
-			config["KeystorePasswordFile"] = opts.account.passwordFile
+			if opts.extra["RedeemerURL"] == nil {
+				config["KeystoreFile"] = opts.account.keystore
+				config["KeystorePasswordFile"] = opts.account.passwordFile
+			}
 			if opts.recipient != (common.Address{}) {
 				config["OrchestratorAddress"] = opts.recipient.Hex()
 			}

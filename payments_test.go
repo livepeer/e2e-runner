@@ -474,7 +474,9 @@ func (f *paidFixture) register(t *testing.T, label, mode, unit string, proxy boo
 func (f *paidFixture) job(t *testing.T, unit, mode string) *paymentJob {
 	t.Helper()
 	reg := f.register(t, fmt.Sprintf("case-%d", time.Now().UnixNano()), mode, unit, false)
-	stop := maintainRunner(t, f.orch, reg, heartbeatPayload{RunnerID: reg.RunnerID, RunnerURL: f.upstream.url, Mode: mode, App: liveRunnerApp, Status: "ready", Capacity: 2, PriceInfo: paidPrice(unit)})
+	heartbeat := heartbeatPayload{RunnerID: reg.RunnerID, RunnerURL: f.upstream.url, Mode: mode, App: liveRunnerApp, Status: "ready", Capacity: 2, PriceInfo: paidPrice(unit)}
+	registerRunnerHTTP(t, f.orch, heartbeat, reg.HeartbeatSecret)
+	stop := maintainRunner(t, f.orch, reg, heartbeat)
 	orch := f.orch
 	var once sync.Once
 	closeRunner := func() { once.Do(func() { stop(); unregisterPaidRunner(t, orch, reg.RunnerID, reg.HeartbeatSecret) }) }

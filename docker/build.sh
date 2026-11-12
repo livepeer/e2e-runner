@@ -2,7 +2,7 @@
 set -euo pipefail
 mkdir -p "$E2E_RUN_ROOT/bin"
 cd "$E2E_NODE_DIR"
-go build -mod=readonly -o "$E2E_RUN_ROOT/bin/node/" ./cmd/livepeer ./cmd/livepeer-orchestrator ./cmd/livepeer-signer ./cmd/livepeer-chain
+go build -mod=readonly -o "$E2E_RUN_ROOT/bin/node/" ./cmd/livepeer ./cmd/livepeer-orchestrator ./cmd/livepeer-signer ./cmd/livepeer-chain ./cmd/livepeer-redeemer
 cd "$E2E_CLEARINGHOUSE_DIR"
 go build -mod=readonly -o "$E2E_RUN_ROOT/bin/clearinghouse" ./cmd/clearinghouse
 cd "$GO_LIVEPEER_DIR"
